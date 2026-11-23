@@ -1,0 +1,29 @@
+# agent / local notes
+CLAUDE.md
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+
+# site configuration and credentials never belong in the repository
+site/
+*.globus*
+.globus/
+.globusonline/
+config-paths
+*.pem
+*.key
+id_*
+tools.json
+!examples/tools.json
+
+# mirror data accidentally created inside the checkout
+PXD[0-9][0-9][0-9][0-9][0-9][0-9]/
+catalog.sqlite*
+.events.jsonl

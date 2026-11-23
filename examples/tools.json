@@ -1,0 +1,51 @@
+{
+ "_comment": "Converter registry for `pxd convert`. Keys starting with _ are ignored. path, env values and deployment_files expand ~ and ${VAR} (from the env block first, then the environment). Optional pins: sha256 (of path) and deployment_sha256 {file: sha256}; a mismatch refuses the tool. Install converters in a directory only maintainers can write (see docs/PERMISSIONS.md). The env block is recorded in every conversion's provenance (manifest and catalogue): never put secrets there. ${VAR} refers to variables defined earlier in the same env block or to the environment.",
+ "openms-fileconverter": {
+  "path": "${OPENMS_PREFIX}/bin/FileConverter",
+  "env": {
+   "OPENMS_PREFIX": "/opt/openms",
+   "DOTNET_ROOT": "/opt/dotnet-8",
+   "LD_LIBRARY_PATH": "${OPENMS_PREFIX}/lib"
+  },
+  "version_args": ["--help"],
+  "version_regex": "Version: (\\S+).*?Revision: (\\S+)",
+  "deploy_root": "prefix",
+  "deployment_files": [
+   "lib/openms_thermo_bridge/managed/ThermoFisher.CommonCore.RawFileReader.dll",
+   "lib/libOpenMS.so"
+  ],
+  "argv": {
+   "mzML": ["-in", "{in}", "-out", "{out}", "-out_type", "mzML", "-no_progress", "-threads", "{threads}"],
+   "mzPeak": ["-in", "{in}", "-out", "{out}", "-out_type", "mzpeak", "-no_progress", "-threads", "{threads}"]
+  },
+  "default_for": {
+   "mzML": [".raw", ".mzxml"],
+   "mzPeak": [".raw", ".mzml", ".mzxml"]
+  },
+  "note": "OpenMS FileConverter built with the Thermo RawFileReader bridge (.NET)"
+ },
+ "mzpeak-convert": {
+  "path": "/opt/mzpeak-convert/0.18.0/mzpeak-convert",
+  "env": {"DOTNET_ROOT": "/opt/dotnet-8"},
+  "version_args": ["--version"],
+  "version_regex": "mzpeak-convert (\\S+)",
+  "deployment_files": ["mzpeak-convert.bin"],
+  "argv": {
+   "mzPeak": ["{in}", "-o", "{out}"],
+   "mzML": ["{in}", "-o", "{out}", "--to", "mzml"]
+  },
+  "default_for": {"mzPeak": [".d", ".d.zip", ".wiff"]},
+  "note": "mzPeak converter for Bruker .d, Thermo .raw and mzML"
+ },
+ "thermorawfileparser": {
+  "path": "/opt/ThermoRawFileParser/ThermoRawFileParser",
+  "env": {},
+  "version_args": ["--version"],
+  "version_regex": "(\\d+\\.\\d+\\.\\d+(?:\\.\\d+)?)",
+  "deployment_files": [],
+  "argv": {"mzML": ["-i={in}", "-b={out}", "-f=2"]},
+  "default_for": {},
+  "refused_unless": "allow_trfp2",
+  "why": "ThermoRawFileParser 2.0.0 writes wrong mzML index offsets (validated after conversion when allowed)"
+ }
+}

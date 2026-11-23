@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Compile
+        run: python -m py_compile src/pxdmirror/*.py tests/*.py
+      - name: Offline tests
+        run: |
+          python -I tests/test_pxdmirror.py
+          python -I tests/test_multiuser.py
+      - name: Wrapper and install
+        run: |
+          bin/pxd --version
+          bin/pxd config
+          python -m pip install .
+          pxd --version

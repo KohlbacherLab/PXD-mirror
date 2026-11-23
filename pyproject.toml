@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pxd-mirror"
+version = "0.1.0"
+description = "A verified, shared local mirror of public PRIDE / ProteomeXchange (PXD) data sets"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "Oliver Kohlbacher" }]
+keywords = ["proteomics", "mass spectrometry", "PRIDE", "ProteomeXchange", "mirror", "Globus"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/KohlbacherLab/PXD-mirror"
+Issues = "https://github.com/KohlbacherLab/PXD-mirror/issues"
+
+[project.scripts]
+pxd = "pxdmirror.cli:run"
+
+[tool.setuptools.packages.find]
+where = ["src"]

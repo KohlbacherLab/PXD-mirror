@@ -1,0 +1,65 @@
+# pxd-mirror configuration (TOML). Every key is optional except paths.root.
+#
+# Where pxd looks (highest precedence first):
+#   command line (--root, --tools)  >  environment (PXD_ROOT, PXD_<SECTION>_<KEY>)  >
+#   --config FILE or $PXD_CONFIG  >  $XDG_CONFIG_HOME/pxd/config.toml (~/.config/pxd/config.toml)  >  defaults
+# `pxd config` prints every effective value and where it came from.
+# Path values expand ~, {user}, {home} and {tmp} (the system temporary directory).
+
+[site]
+name = "PRIDE mirror"                     # heading of the README that `pxd init` writes into the root
+
+[paths]
+root = "/data/shared/pxd"                 # REQUIRED: the mirror root (one directory per PXD accession below it)
+scratch = "{tmp}/pxd-{user}"              # per-user staging for conversions (node-local disk is best)
+# tools = "tools.json"                    # converter registry; relative paths are relative to this file;
+                                          # default: tools.json next to this file, if present
+forbidden_roots = []                      # e.g. ["/data/backup"]: pxd refuses to use or stage into these
+
+[permissions]
+shared = true                             # true: group-shared mirror (dirs 2770 setgid, files 660)
+                                          # false: private mirror (dirs 700, files 600)
+group = ""                                # expected group of the root, e.g. "proteomics"; `pxd init` applies it,
+                                          # `pxd doctor` reports a mismatch
+default_acl = true                        # `pxd init` adds a default ACL (group rwx, other none) where supported
+umask = ""                                # octal; empty = 007 when shared, 077 when private
+
+[limits]
+quota_margin_gb = 50                      # free space kept in reserve when downloading
+lock_wait_s = 600                         # wait this long for a busy data set before giving up
+
+[transfer]
+methods = ["globus", "ftp", "https"]      # order for --method auto (globus is used only if [globus] is set up)
+split = 4                                 # parallel HTTPS byte ranges for large files
+split_min_mb = 100                        # ... from this size on
+max_attempts = 4                          # per method and file
+max_total = 8                             # per file, all methods together
+backoff_s = 30                            # first retry delay (doubles, jittered, capped at 600 s)
+stop_after = 3                            # consecutive failed files before the rest are not attempted
+
+[pride]
+api = "https://www.ebi.ac.uk/pride/ws/archive/v3"
+ftp_base = "ftp://ftp.pride.ebi.ac.uk/"
+https_base = "https://ftp.pride.ebi.ac.uk/"
+
+[globus]
+enabled = false                           # see docs/GLOBUS.md before switching this on
+cli = "globus"                            # name on PATH or absolute path of the globus CLI
+source_collection = "47772002-3e5b-4fd3-b97c-18cee38d6df2"   # EMBL-EBI Public Data (public, no consent needed)
+dest_collection = ""                      # UUID of YOUR endpoint/collection that can write into paths.root
+kind = "gcp"                              # gcp = Globus Connect Personal, gcs = Globus Connect Server collection
+path_map = []                             # ["/local/prefix", "/collection/prefix"]; empty = identity (GCP)
+gcp_config_dir = "~/.globusonline"        # GCP's configuration directory (-dir); gcp only
+check_config_paths = true                 # gcp only: require paths.root as a writable entry in
+                                          # <gcp_config_dir>/lta/config-paths
+shared_prefixes = []                      # roots below these are on a file system the GCP host also sees;
+                                          # elsewhere GCP must run on the node where pxd runs
+wait_hours = 72                           # how long `pxd get` waits for a Globus task
+
+[stage]
+ssh_options = ["-o", "BatchMode=yes"]     # for `pxd stage ... --to HOST:PATH`
+rsync_options = ["-rt", "--partial", "--mkpath"]
+
+# Per-host overrides (shell-style patterns on HOST, last match wins), e.g. a dedicated key for a cluster:
+# [stage.hosts."login*.cluster.example.org"]
+# ssh_options = ["-o", "BatchMode=yes", "-i", "~/.ssh/id_ed25519_cluster", "-o", "IdentitiesOnly=yes"]
