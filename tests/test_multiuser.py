@@ -447,6 +447,11 @@ def convert_tests(base):
     sp["recipe_deployment_sha256"] = {"dep.dll": old_sha}
     ok("recipe: recipe_deployment_sha256 keeps the earlier name; provenance keeps the actual hash",
        cv.recipe("fakeconv", i2, sp, "mzML") == r1 and i2["deployment"]["dep.dll"] != old_sha)
+    sp2 = dict(sp, recipe_deployment={"dep.dll": old_sha})
+    sp2.pop("recipe_deployment_sha256")
+    i3 = dict(i2, deployment={"moved/dep.dll": i2["deployment"]["dep.dll"]})
+    ok("recipe: recipe_deployment keeps the earlier name after the pins moved to other files",
+       cv.recipe("fakeconv", i3, sp2, "mzML") == r1 and cv.recipe("fakeconv", i3, sp, "mzML") != r1)
     os.unlink(dep)
     reg["fakeconv"].pop("deployment_files")
     reg["fakeconv"]["sha256"] = "0" * 64

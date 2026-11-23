@@ -25,3 +25,22 @@ Copy the new version into the installation without touching `site/` (and any con
 it), keep directories `2755`, files `644` and `bin/pxd` `755`, then run `bin/pxd config` and `bin/pxd doctor`
 as a member. After changing a converter deployment, run `bin/pxd tools` and update the pins in
 `site/tools.json`.
+
+### Checking what a converter really opens
+
+pxd checks the directories it knows about (the deployment, `env` directories, `ldd` libraries). A converter
+can still open files through paths compiled into it ([PERMISSIONS.md](PERMISSIONS.md), "Compiled-in
+paths"). After installing or changing a converter, trace one real conversion with the registry's exact
+environment, on Linux, and list every file opened outside the converter's trees and the system
+directories:
+
+```bash
+# env: the converter's env block from tools.json, exported first
+strace -f -e trace=openat,open,stat,newfstatat,execve -o trace.txt \
+    <converter> <arguments for a small test file in a temporary directory>
+grep -v ENOENT trace.txt | grep -oE '"/[^"]*"' | tr -d '"' | sort -u \
+    | grep -vE '^(<deployment>|<runtime dirs>|<temp dir>|/usr/|/lib|/lib64|/etc/|/proc/|/sys/|/dev/|/run/)'
+```
+
+Anything left is loaded from outside what pxd checks and pins. Only the caller's own home directory (for
+example `~/.config/OpenMS`) is acceptable. For anything else, fix the deployment first.

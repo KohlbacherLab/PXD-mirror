@@ -106,6 +106,24 @@ must be group-writable. Keep the two apart.
   from renaming entries they do not own. `pxd doctor` and `pxd config` warn about such parents of the
   installation, and `pxd convert` about such parents of a converter.
 
+### Compiled-in paths
+
+Copying a converter is not enough when it has absolute paths compiled in, because they still point at the
+original location. If that location (or a directory above it) is group-writable, a member can put their own
+files there, and every member's conversion then loads them, although the copied tree, its pins and
+`tree_sha256` are unchanged.
+
+OpenMS: `libOpenMS.so` contains the install prefix's `share/OpenMS` (and `share/doc`) and the build tree's
+`share/OpenMS`, and tries them before `<prefix>/share/OpenMS` next to the executable. `OPENMS_DATA_PATH` is
+only the last fallback, so it cannot redirect a copy. Either build OpenMS with the final install prefix, or
+overwrite those strings in the copied `libOpenMS.so` with paths **of the same length** that nobody can
+create, such as `/proc/disabled-...` padded to length, so that OpenMS falls back to the copy's own
+`share/OpenMS`. Then pin the files OpenMS actually loads (`share/OpenMS/openms_thermo_bridge/managed/`
+`ThermoFisher.CommonCore.RawFileReader.dll` and `ThermoWrapperManaged.dll`) in `deployment_files`. Keep the
+recipe name with `recipe_deployment` when the computation is unchanged. Remove the original tree, or make
+it and its parents writable only by the maintainers, so it cannot be used to plant files either way. Check
+the result by tracing a real conversion ([MAINTAINING.md](MAINTAINING.md)).
+
 ### Per-user staging
 
 `pxd convert` copies the input into `paths.scratch` (default `{tmp}/pxd-{user}`) and runs the converter

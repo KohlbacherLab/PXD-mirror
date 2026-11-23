@@ -964,8 +964,8 @@ class Mirror:
                 cid = f"{acc}:{name}:{fmt}:{rec}"
                 entry = {"source_name": name, "source_md5": src["md5"], "format": fmt, "recipe": rec, "output_path": rel,
                          "tool": {**{k: ident[k] for k in ("name", "version", "path", "sha256", "deployment", "tree_sha256")},
-                                  **({"recipe_deployment_sha256": spec["recipe_deployment_sha256"]}
-                                     if spec.get("recipe_deployment_sha256") else {})},
+                                  **{k: spec[k] for k in ("recipe_deployment_sha256", "recipe_deployment")
+                                     if spec.get(k)}},
                          "argv": [a.replace(sd, "<stage>") for a in argv], "env": spec.get("env", {}),
                          "host": socket.gethostname(), "started": started, "seconds": secs,
                          "validator": cv.VALIDATOR, "validation": val, "status": "ok" if val["ok"] else "failed"}

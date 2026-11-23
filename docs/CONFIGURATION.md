@@ -154,6 +154,7 @@ is a template. Per converter:
 | `sha256`, `deployment_sha256` | optional pins of the executable and of the deployment files; a mismatch refuses the tool |
 | `tree_sha256` | optional pin over every file the converter may load (`pxd tools` prints it); catches a changed library that is not listed |
 | `recipe_deployment_sha256` | `{file: earlier sha256}`: the maintainer declares a relinked or moved deployment equivalent, so the recipe name (and with it existing conversions) stays; the provenance still records the actual hashes |
+| `recipe_deployment` | `{file: sha256}`, the complete earlier set of deployment files: replaces the actual ones in the recipe hash, for when the pins move to other files (for example to the copies the tool really loads) without changing what it computes |
 | `refused_unless`, `why` | `"allow_trfp2"`: the tool runs only with `convert --allow-trfp2` |
 
 Before every conversion pxd checks what the converter may load: the deployment directory, every directory
@@ -163,6 +164,15 @@ tool is refused. A group-writable directory *above* a deployment (which would le
 deployment away) is reported as a warning. The files are fingerprinted (inode, size, times, mode, owner), so a
 converter that changes while pxd runs is hashed again (and refused if a pin no longer matches) before it
 runs. Do not name directories in `env` that others can write (for example `/tmp` or a group work area).
+
+These checks cover only the directories pxd knows about. A converter can also open files through absolute
+paths compiled into it, and those are invisible to `trust_scan`, the fingerprint and `tree_sha256`. OpenMS
+is the common case: `libOpenMS.so` holds its build's install and build `share/OpenMS` directories, and
+current OpenMS versions try those *before* the directory next to the executable and use `OPENMS_DATA_PATH`
+only as a last resort. A copied OpenMS therefore keeps loading its CV files, mapping files and the managed
+Thermo bridge assemblies (`share/OpenMS/openms_thermo_bridge/managed/*.dll`) from the original location,
+and setting `OPENMS_DATA_PATH` does not change that. See "Compiled-in paths" in
+[PERMISSIONS.md](PERMISSIONS.md) for the fix and [MAINTAINING.md](MAINTAINING.md) for the check.
 
 ## Examples
 

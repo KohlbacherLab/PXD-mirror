@@ -215,10 +215,13 @@ def identify(name, spec):
 def recipe(name, ident, spec, fmt):
     """<tool>-<version>-<hash of format, fixed arguments and deployment files>. A maintainer who relinks or moves a
     deployment without changing what it computes may declare that in "recipe_deployment_sha256" ({file: the
-    earlier sha256}): the recipe name then stays, while the provenance records the actual hashes."""
+    earlier sha256}): the recipe name then stays, while the provenance records the actual hashes. After moving
+    the pins to other files (e.g. to the copies the tool actually loads), "recipe_deployment" ({file: sha256},
+    the complete earlier set) replaces the deployment files in the hash altogether."""
     fixed = [a for a in spec["argv"][fmt] if a not in ("{in}", "{out}", "{threads}")]
     same = spec.get("recipe_deployment_sha256") or {}
-    dep = {k: same.get(k, v) for k, v in ident["deployment"].items()}
+    dep = dict(spec["recipe_deployment"]) if spec.get("recipe_deployment") else \
+        {k: same.get(k, v) for k, v in ident["deployment"].items()}
     h = hashlib.sha256(json.dumps([fmt, fixed, sorted(dep.items())]).encode()).hexdigest()[:8]
     v = re.sub(r"[^A-Za-z0-9.]+", "-", ident["version"])[:40].strip("-")
     return f"{name}-{v}-{h}"

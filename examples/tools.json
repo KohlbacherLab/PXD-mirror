@@ -1,5 +1,5 @@
 {
- "_comment": "Converter registry for `pxd convert`. Keys starting with _ are ignored. path, env values and deployment_files expand ~ and ${VAR} (from the env block first, then the environment). Optional pins: sha256 (of path), deployment_sha256 {file: sha256} and tree_sha256 (every file the tool may load; pxd tools prints it); a mismatch refuses the tool. recipe_deployment_sha256 {file: earlier sha256} keeps the recipe name of a relinked deployment. Install converters, their libraries and runtimes where only maintainers can write: pxd refuses a tool whose deployment, env directories or ldd libraries others can change (see docs/CONFIGURATION.md and docs/PERMISSIONS.md). The env block is recorded in every conversion's provenance (manifest and catalogue): never put secrets there. ${VAR} refers to variables defined earlier in the same env block or to the environment.",
+ "_comment": "Converter registry for `pxd convert`. Keys starting with _ are ignored. path, env values and deployment_files expand ~ and ${VAR} (from the env block first, then the environment). Optional pins: sha256 (of path), deployment_sha256 {file: sha256} and tree_sha256 (every file the tool may load; pxd tools prints it); a mismatch refuses the tool. recipe_deployment_sha256 {file: earlier sha256} keeps the recipe name of a relinked deployment. recipe_deployment {file: sha256} (the complete earlier set) keeps it after the pins moved to other files. Install converters, their libraries and runtimes where only maintainers can write: pxd refuses a tool whose deployment, env directories or ldd libraries others can change (see docs/CONFIGURATION.md and docs/PERMISSIONS.md). The env block is recorded in every conversion's provenance (manifest and catalogue): never put secrets there. ${VAR} refers to variables defined earlier in the same env block or to the environment.",
  "openms-fileconverter": {
   "path": "${OPENMS_PREFIX}/bin/FileConverter",
   "env": {
@@ -11,7 +11,8 @@
   "version_regex": "Version: (\\S+).*?Revision: (\\S+)",
   "deploy_root": "prefix",
   "deployment_files": [
-   "lib/openms_thermo_bridge/managed/ThermoFisher.CommonCore.RawFileReader.dll",
+   "share/OpenMS/openms_thermo_bridge/managed/ThermoFisher.CommonCore.RawFileReader.dll",
+   "share/OpenMS/openms_thermo_bridge/managed/ThermoWrapperManaged.dll",
    "lib/libOpenMS.so"
   ],
   "argv": {
@@ -22,7 +23,7 @@
    "mzML": [".raw", ".mzxml"],
    "mzPeak": [".raw", ".mzml", ".mzxml"]
   },
-  "note": "OpenMS FileConverter built with the Thermo RawFileReader bridge (.NET)"
+  "note": "OpenMS FileConverter built with the Thermo RawFileReader bridge (.NET). OpenMS loads its share/OpenMS (CV and mapping files, the managed Thermo assemblies) from the install path compiled into libOpenMS.so before the copy next to bin/, and OPENMS_DATA_PATH is only a last fallback: build it with this prefix, or neutralise the compiled-in paths of a copied tree (docs/PERMISSIONS.md, Compiled-in paths)"
  },
  "mzpeak-convert": {
   "path": "/opt/mzpeak-convert/0.18.0/mzpeak-convert",

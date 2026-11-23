@@ -39,6 +39,9 @@ First public release.
   their transaction; deletes check every item first; manifests and inventories with a wrong structure or
   unsafe names are reported as corrupt; staging refuses targets inside the mirror, validates hosts and
   protects rsync arguments; query and get compare with the current PRIDE checksums; clearer exit codes.
+- Converters with compiled-in paths: documentation of the OpenMS case (its compiled-in `share/OpenMS` wins
+  over the copy next to the executable and over `OPENMS_DATA_PATH`), a tracing check for installers, and
+  `recipe_deployment` to keep a recipe name after the pins move to the files actually loaded.
 - Documentation (configuration, Globus, permissions, operations, design with threat model and known
   limitations), Claude Code skill, CI.
 
