@@ -23,6 +23,17 @@ First public release.
 - Optional sha256 pins for converter binaries and deployment files; `${VAR}` and `~` in the registry.
 - `paths.forbidden_roots`; per-host ssh and rsync options for remote staging; shell-safe quoting of remote
   paths.
+- Second review round: `pxd recover` and Globus adoption act only on intents the caller wrote (owner from the
+  file, intents written 640); converters are refused if anything they load (deployment, `env` directories,
+  `ldd` libraries) can be changed by another user, re-checked before every run, with an optional
+  `tree_sha256` pin and `recipe_deployment_sha256` for relinked deployments; conversion staging must be
+  private and not replaceable through a world-writable parent; `paths.forbidden_roots` also covers
+  conversion staging, migration sources and plan files and legacy imports; an archived file is replaced
+  only once a verified copy exists, and a Globus delivery without a PRIDE checksum never replaces one;
+  adopted Globus tasks publish only the requested files; `delete` handles Globus tasks still in flight;
+  configuration layers `$PXD_SITE_CONFIG` < personal file < `--config`, `[stage.hosts]` merged per pattern,
+  overridden values listed by `pxd config`; `pxd config` and `pxd doctor` warn when the installation or a
+  directory above it can be changed by other users.
 - Hardening from an adversarial review: recovery validates intents (paths inside the mirror, accession,
   MD5) and takes the data-set and per-intent locks; catalogue updates and reindex read the records inside
   their transaction; deletes check every item first; manifests and inventories with a wrong structure or

@@ -52,7 +52,8 @@ git clone https://github.com/KohlbacherLab/PXD-mirror && PXD-mirror/bin/pxd --ve
 ```
 
 `bin/pxd` runs the package with `python3 -I` from its own checkout. For a group installation, unpack a release
-into a directory only maintainers can write, put the site configuration in `<installation>/site/config.toml`
+into a directory only maintainers can write (and whose parents only root or maintainers can write, or carry the
+sticky bit), put the site configuration in `<installation>/site/config.toml`
 (picked up automatically by `bin/pxd`) and let users call `<installation>/bin/pxd`. See
 [docs/PERMISSIONS.md](docs/PERMISSIONS.md#installing-the-tool-for-a-group).
 
@@ -155,12 +156,13 @@ Design and rationale: [docs/DESIGN.md](docs/DESIGN.md).
 
 pxd needs one setting, the mirror root. Everything else has generic defaults (Globus off, private scratch in
 the system temporary directory, group-shared modes). Precedence: command line > `PXD_*` environment >
-`--config FILE` / `$PXD_CONFIG` > `~/.config/pxd/config.toml` > defaults.
+`--config FILE` / `$PXD_CONFIG` > `~/.config/pxd/config.toml` > `$PXD_SITE_CONFIG` (the site file of a shared
+installation) > defaults.
 
 ```toml
 [paths]
 root = "/shared/proteomics/pxd"
-scratch = "/scratch/{user}/pxd"
+scratch = "/tmp/pxd-{user}"                # node-local; must not be replaceable by other users
 [permissions]
 group = "proteomics"
 ```
@@ -219,7 +221,8 @@ The offline tests need no network and run in a temporary directory. For `--two-n
 ## Contributing
 
 Issues and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md) and the
-[Code of Conduct](CODE_OF_CONDUCT.md). Security issues: [SECURITY.md](SECURITY.md).
+[Code of Conduct](CODE_OF_CONDUCT.md). Security issues: [SECURITY.md](SECURITY.md). Maintainers:
+[docs/MAINTAINING.md](docs/MAINTAINING.md).
 
 ## Citation
 

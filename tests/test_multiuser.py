@@ -256,7 +256,13 @@ def foreign_tests(base):
     foreign_inbox = util.mkdirs(m.work(acc, "globus", "globus-foreign"))
     ip = os.path.join(root, ".ops", "globus-foreign.json")
     util.write_json(ip, {"op": "globus-foreign", "kind": "globus", "task": "TF", "accession": acc, "inbox": foreign_inbox,
-                         "files": ["f2.raw"], "uid": me + 1, "user": "someone", "dest_collection": ""})
+                         "files": ["f2.raw"], "uid": me, "user": "someone", "dest_collection": ""}, 0o640)
+    real_read_own = st_mod.read_own_json
+
+    def foreign(path, what="record"):                # the file owner decides (a uid field in the JSON is ignored)
+        obj, owner, problem = real_read_own(path, what)
+        return (obj, me + 1, "written by someone") if path.endswith("globus-foreign.json") else (obj, owner, problem)
+    st_mod.read_own_json = foreign
     saved = (tx.subprocess, tx.globus_usable, tx.globus_submit)
     tx.subprocess = types.SimpleNamespace(run=run, TimeoutExpired=subprocess.TimeoutExpired, CompletedProcess=subprocess.CompletedProcess)
     tx.globus_usable, tx.globus_submit = (lambda root: None), submit
@@ -270,17 +276,22 @@ def foreign_tests(base):
     ok("globus: the foreign intent is kept for its owner; ours records user, uid and destination",
        [i["op"] for i in its] == ["globus-foreign"], its)
     rec = m.recover()
-    ok("recover: reports another user's Globus intent without querying it", any("someone" in r[1] or "uid" in r[1] for r in rec), rec)
+    st_mod.read_own_json = real_read_own
+    ok("recover: reports another user's Globus intent without querying it",
+       any("only its owner" in r[1] and "TF" in r[1] for r in rec), rec)
 
     # an intent that vanishes while recover runs (finished by another user's get) is skipped (M6)
     orig = st_mod.read_json
+    orig_own = st_mod.read_own_json
     st_mod.read_json = lambda path, what="record": None if path.endswith(".json") and "/.ops/" in path else orig(path, what)
+    st_mod.read_own_json = lambda path, what="record": (None, None, None) if "/.ops/" in path else orig_own(path, what)
     try:
         rec, err = m.recover(), None
     except Exception as e:
         rec, err = None, e
     finally:
         st_mod.read_json = orig
+        st_mod.read_own_json = orig_own
     ok("recover: a vanished intent is skipped, not a crash", err is None, repr(err))
 
     # lock files that are not writable for us still lock (M5)
@@ -355,6 +366,8 @@ def convert_tests(base):
                         "version_regex": r"fakeconv (\S+)", "argv": {"mzML": ["{in}", "-o", "{out}"]},
                         "default_for": {"mzML": [".raw"]}, "sha256": sha}}
     tj = write(os.path.join(tdir, "tools.json"), json.dumps(reg))
+    os.chmod(tdir, 0o755)                     # converters live where only their maintainer can write
+    os.chmod(tj, 0o644)
     root = os.path.join(base, "conv")
     c = cfg_for(root, f'tools = "{tj}"\n')
     m = Mirror(config=c)
@@ -371,12 +384,94 @@ def convert_tests(base):
     ok("convert: per-user scratch created private (700)", os.path.isdir(scratch) and mode(scratch) & 0o777 == 0o700, scratch)
     conv = list(m.manifest(acc)["conversions"].values())[0]
     ok("convert: provenance has version and sha256", conv["tool"]["version"] == "1.2.3" and conv["tool"]["sha256"] == sha, conv["tool"])
+    ok("convert: provenance records the tree hash", len(conv["tool"].get("tree_sha256") or "") == 64, conv["tool"])
+    rec1 = conv["recipe"]
+
+    # the binary is swapped after the first conversion in the same process: the next one re-hashes and refuses
+    spec = cv.load_tools(tj)["fakeconv"]
+    cv.identify("fakeconv", spec)
+    write(exe, FAKE_CONV.replace("1.2.3", "6.6.6"))
+    os.chmod(exe, 0o755)
+    ok("tools: a pinned executable swapped within one process is refused before it runs",
+       raises(lambda: cv.identify("fakeconv", spec), PxdError))
+    inv2 = fake_inventory(m, "PXD000116", {"e.raw": b"E" * 64})
+    publish_file(m, inv2, "PXD000116", "e.raw", b"E" * 64)
+    res = m.convert("PXD000116", ["e.raw"], "mzML")
+    ok("convert: ... and convert reports it as failed", res[0][1] == "failed" and "sha256" in res[0][2], res)
+    write(exe, FAKE_CONV)
+    os.chmod(exe, 0o755)
+
+    # entries another member could change: a group-writable deployment directory, a symlink to a writable file
+    os.chmod(tdir, 0o775)
+    cv._ID.clear()
+    ok("tools: a group-writable deployment directory refuses the tool",
+       raises(lambda: cv.identify("fakeconv", cv.load_tools(tj)["fakeconv"]), PxdError))
+    os.chmod(tdir, 0o755)
+    shared = os.path.join(base, "shared-lib")
+    os.makedirs(shared, exist_ok=True)
+    os.chmod(shared, 0o777)
+    lib = write(os.path.join(shared, "libx.so"), "x")
+    os.symlink(lib, os.path.join(tdir, "libx.so"))
+    cv._ID.clear()
+    ok("tools: a symlink to a file in a writable directory outside the deployment refuses the tool",
+       raises(lambda: cv.identify("fakeconv", cv.load_tools(tj)["fakeconv"]), PxdError))
+    os.unlink(os.path.join(tdir, "libx.so"))
+    os.chmod(shared, 0o755)
+
+    # tree pin, recipe compatibility declaration
+    good = cv.identify("fakeconv", cv.load_tools(tj)["fakeconv"])
+    reg["fakeconv"]["tree_sha256"] = "1" * 64
+    write(tj, json.dumps(reg))
+    cv._ID.clear()
+    ok("tools: a tree_sha256 pin that does not match refuses the tool",
+       raises(lambda: cv.identify("fakeconv", cv.load_tools(tj)["fakeconv"]), PxdError))
+    reg["fakeconv"]["tree_sha256"] = good["tree_sha256"]
+    dep = write(os.path.join(tdir, "dep.dll"), "v1")
+    os.chmod(dep, 0o644)
+    reg["fakeconv"]["deployment_files"] = ["dep.dll"]
+    write(tj, json.dumps(reg))
+    cv._ID.clear()
+    ok("tools: a tree_sha256 pin catches a changed file the registry does not list",
+       raises(lambda: cv.identify("fakeconv", cv.load_tools(tj)["fakeconv"]), PxdError))
+    del reg["fakeconv"]["tree_sha256"]
+    write(tj, json.dumps(reg))
+    cv._ID.clear()
+    sp = cv.load_tools(tj)["fakeconv"]
+    i1 = cv.identify("fakeconv", sp)
+    r1 = cv.recipe("fakeconv", i1, sp, "mzML")
+    old_sha = i1["deployment"]["dep.dll"]
+    write(dep, "v2 relinked")
+    cv._ID.clear()
+    i2 = cv.identify("fakeconv", sp)
+    ok("recipe: a changed deployment file changes the recipe", cv.recipe("fakeconv", i2, sp, "mzML") != r1)
+    sp["recipe_deployment_sha256"] = {"dep.dll": old_sha}
+    ok("recipe: recipe_deployment_sha256 keeps the earlier name; provenance keeps the actual hash",
+       cv.recipe("fakeconv", i2, sp, "mzML") == r1 and i2["deployment"]["dep.dll"] != old_sha)
+    os.unlink(dep)
+    reg["fakeconv"].pop("deployment_files")
     reg["fakeconv"]["sha256"] = "0" * 64
     write(tj, json.dumps(reg))
     cv._ID.clear()
     ok("tools: a pinned sha256 that does not match refuses the tool",
        raises(lambda: cv.identify("fakeconv", cv.load_tools(tj)["fakeconv"]), PxdError))
+    reg["fakeconv"]["sha256"] = sha
+    write(tj, json.dumps(reg))
     cv._ID.clear()
+
+    # conversion staging another user could rename away, or under a forbidden root
+    ww = os.path.join(base, "worldwritable")
+    os.makedirs(ww, exist_ok=True)
+    os.chmod(ww, 0o777)
+    res = m.convert("PXD000116", ["e.raw"], "mzML", stage=os.path.join(ww, "me", "pxd"), tools_json=tj)
+    ok("convert: staging below a world-writable directory without the sticky bit is refused",
+       res[0][1] == "failed" and "replace" in res[0][2], res)
+    os.chmod(ww, 0o755)
+    cf = Mirror(config=cfg_for(root, f'tools = "{tj}"\nforbidden_roots = ["{ww}"]\n'))
+    res = cf.convert("PXD000116", ["e.raw"], "mzML", stage=os.path.join(ww, "st"))
+    ok("convert: staging under a forbidden root is refused", res[0][1] == "failed" and "forbidden" in res[0][2], res)
+    ok("convert: ... and nothing was created there", not os.path.exists(os.path.join(ww, "st")))
+    cv._ID.clear()
+    del rec1
 
 
 # ------------------------------------------------------------------ doctor
@@ -403,6 +498,14 @@ def doctor_tests(base):
     r = m.doctor(fix=True)
     ok("doctor --fix: repairs own entries", r["fixed"] >= 2 and mode(dest) == 0o660 and dir_ok(m.ds(acc)), (r, oct(mode(dest))))
     ok("doctor: clean after --fix", not m.doctor()["problems"])
+    ip = os.path.join(root, ".ops", "pub-x.json")
+    util.write_json(ip, {"op": "pub-x", "kind": "publish"}, 0o640)
+    ok("doctor: an intent written 640 is not a problem", not m.doctor()["problems"], m.doctor()["problems"])
+    os.chmod(ip, 0o660)
+    r = m.doctor(fix=True)
+    ok("doctor --fix: a group-writable intent is reported, never made trusted by --fix",
+       mode(ip) == 0o660 and any(k.startswith("intent mode") for k in r["problems"]), (oct(mode(ip)), r["problems"]))
+    os.unlink(ip)
     del before
 
 
@@ -464,9 +567,9 @@ def review_tests(base):
     bad = {"op": "pub-evil", "kind": "publish", "accession": acc, "rel": "raw/b.raw", "staged": victim,
            "md5": hashlib.md5(b"precious").hexdigest(), "backlink": None,
            "record": {"kind": "file", "key": "b.raw", "entry": {"md5": hashlib.md5(b"precious").hexdigest()}}}
-    util.write_json(os.path.join(root, ".ops", "pub-evil.json"), bad)
-    util.write_json(os.path.join(root, ".ops", "pub-evil2.json"), dict(bad, op="pub-evil2", accession="../../x"))
-    util.write_json(os.path.join(root, ".ops", "pub-evil3.json"), {"kind": "publish"})
+    util.write_json(os.path.join(root, ".ops", "pub-evil.json"), bad, 0o640)
+    util.write_json(os.path.join(root, ".ops", "pub-evil2.json"), dict(bad, op="pub-evil2", accession="../../x"), 0o640)
+    util.write_json(os.path.join(root, ".ops", "pub-evil3.json"), {"kind": "publish"}, 0o640)
     rec = dict(m.recover())
     ok("recover: intents with outside paths, a bad accession or missing keys need attention, nothing touched",
        all("NEEDS ATTENTION" in rec.get(k, "") for k in ("pub-evil.json", "pub-evil2.json", "pub-evil3.json"))
@@ -475,6 +578,32 @@ def review_tests(base):
     ok("cli: recover exits 1 when something needs attention", r.returncode == 1, r.stdout + r.stderr)
     for f in ("pub-evil.json", "pub-evil2.json", "pub-evil3.json"):
         os.unlink(os.path.join(root, ".ops", f))
+
+    # review: a group member plants a publish intent whose staged/backlink/migrated_from all name a file in another
+    # member's home; recover must never create that symlink (the intent is not the caller's own)
+    bait = publish_file(m, inv, acc, "b.raw", files["b.raw"])
+    home_target = os.path.join(base, "victim-home", ".bash_profile")
+    os.makedirs(os.path.dirname(home_target), exist_ok=True)
+    md5b = hashlib.md5(files["b.raw"]).hexdigest()
+    plant = {"op": "pub-plant", "kind": "publish", "accession": acc, "rel": "raw/b.raw", "staged": home_target,
+             "backlink": home_target, "md5": md5b,
+             "record": {"kind": "file", "key": "b.raw", "entry": {"migrated_from": home_target, "md5": md5b}}}
+    ip = os.path.join(root, ".ops", "pub-plant.json")
+    util.write_json(ip, plant)                         # 660: writable for the group, as a planted file would be
+    rec = dict(m.recover())
+    ok("recover: a group-writable publish intent is not acted on", "NEEDS ATTENTION" in rec.get("pub-plant", "")
+       and not os.path.lexists(home_target), rec)
+    os.chmod(ip, 0o640)
+    real_read_own = st_mod.read_own_json
+    st_mod.read_own_json = lambda path, what="record": (real_read_own(path, what)[0], os.getuid() + 1, "written by someone")
+    try:
+        rec = dict(m.recover())
+    finally:
+        st_mod.read_own_json = real_read_own
+    ok("recover: another member's publish intent is only reported; no symlink at its paths",
+       "only its owner" in rec.get("pub-plant", "") and not os.path.lexists(home_target) and os.path.exists(ip), rec)
+    os.unlink(ip)
+    ok("recover: the bait file stays where it was", os.path.isfile(bait))
 
     # delete checks every item before removing any
     publish_file(m, inv, acc, "b.raw", files["b.raw"])
@@ -581,6 +710,150 @@ def config_type_tests(base):
     ok("config: the higher-precedence file's tools.json wins", c.get("paths", "tools") == os.path.join(d2, "tools.json"), c.get("paths", "tools"))
 
 
+# ------------------------------------------------------------------ review round 4 regressions
+def inventory_with(m, acc, files, cks):
+    """An inventory generation of @p files whose checksum list covers only @p cks ({name: md5})."""
+    raw = {"project": {"title": "test"}, "files": [
+        {"fileName": n, "fileSizeBytes": len(b), "fileCategory": {"value": "RAW"},
+         "publicFileLocations": [{"name": "FTP Protocol", "value": f"ftp://ftp.pride.ebi.ac.uk/pride/data/archive/2012/03/{acc}/{n}"}]}
+        for n, b in files.items()],
+        "checksum": "".join(f"{n}\t{h}\t{len(files[n])}\n" for n, h in cks.items())}
+    util.mkdirs(m.ds(acc))
+    return inv_mod.publish(m.ds(acc), acc, raw)
+
+
+def own_intent(m, acc, oid, names, contents):
+    inbox = util.mkdirs(m.work(acc, "globus", oid))
+    for n in names:
+        if n in contents:
+            open(os.path.join(inbox, n), "wb").write(contents[n])
+    it = {"op": oid, "kind": "globus", "task": "T-" + oid, "accession": acc, "inbox": inbox, "files": list(names),
+          "created": util.now(), "user": util.user(), "dest_collection": tx.G["dest"]}
+    ip = os.path.join(m.root, ".ops", oid + ".json")
+    util.write_json(ip, it, 0o640)
+    return ip, it
+
+
+def review4_tests(base):
+    root = os.path.join(base, "review4")
+    m = Mirror(config=cfg_for(root))
+    m.init()
+    m.margin = 0
+    md5 = lambda b: hashlib.md5(b).hexdigest()
+
+    # Globus: a file without a PRIDE checksum never replaces an archived copy; a failed task's delivery is not used
+    acc = "PXD000120"
+    good, short = b"N" * 500, b"N" * 100
+    files = {"n.raw": good, "k.raw": b"K" * 300}
+    inv = inventory_with(m, acc, files, {"k.raw": md5(b"K" * 300)})
+    publish_file(m, inv, acc, "n.raw", good)                  # local baseline (no PRIDE md5)
+    ip, it = own_intent(m, acc, "globus-r4a", ["n.raw"], {"n.raw": short})
+    done, _ = m._globus_collect(acc, inv, ip, it, "FAILED")
+    ok("globus: a failed task's delivery of a checksumless file is not published; the archived copy stays",
+       not done and open(m.ds(acc, "raw", "n.raw"), "rb").read() == good
+       and m.manifest(acc)["files"]["n.raw"]["md5"] == md5(good), done)
+    ip, it = own_intent(m, acc, "globus-r4b", ["n.raw"], {"n.raw": b"M" * 500})
+    done, _ = m._globus_collect(acc, inv, ip, it, "SUCCEEDED")
+    ok("globus: a checksumless delivery that differs from the archived copy does not replace it",
+       not done and open(m.ds(acc, "raw", "n.raw"), "rb").read() == good, done)
+
+    # Globus: only the requested names are published; the rest stays in the inbox with the intent
+    acc2 = "PXD000121"
+    f2 = {"a.raw": b"A" * 200, "b.raw": b"B" * 200}
+    inv2 = inventory_with(m, acc2, f2, {n: md5(b) for n, b in f2.items()})
+    ip, it = own_intent(m, acc2, "globus-r4c", ["a.raw", "b.raw"], f2)
+    done, _ = m._globus_collect(acc2, inv2, ip, it, "SUCCEEDED", ["a.raw"])
+    ok("globus: an adopted task publishes only what this get asked for", done == {"a.raw"}
+       and not os.path.exists(m.ds(acc2, "raw", "b.raw")) and os.path.exists(os.path.join(it["inbox"], "b.raw"))
+       and os.path.exists(ip), done)
+
+    # delete: an in-flight Globus task is part of the plan; its deliveries never bring the data set back
+    plan = m.delete_plan(acc2, dataset=True)
+    ok("delete: the plan lists the Globus task still carrying files of the data set",
+       [g["op"] for g in plan["globus"]] == ["globus-r4c"], plan)
+    m.delete(acc2, dataset=True, token=plan["token"])
+    ok("delete: the delivered but unpublished file is removed from the inbox",
+       not os.path.exists(os.path.join(it["inbox"], "b.raw")))
+    open(os.path.join(it["inbox"], "b.raw"), "wb").write(f2["b.raw"])        # the task delivers it later
+    done, _ = m._globus_collect(acc2, inv2, ip, it, "SUCCEEDED", ["a.raw", "b.raw"])
+    man = m.manifest(acc2)
+    ok("delete: a later delivery is discarded and the data set stays deleted",
+       not done and man.get("status") == "deleted" and not os.path.exists(m.ds(acc2, "raw", "b.raw"))
+       and not os.path.exists(os.path.join(it["inbox"], "b.raw")), (done, man.get("status")))
+    ok("delete: a token computed without the Globus task does not match", plan["token"] != m.delete_plan(acc, dataset=True)["token"])
+
+    # get of a file whose PRIDE md5 changed: the archived copy stays until a verified replacement exists
+    acc3 = "PXD000122"
+    old, new = b"O" * 300, b"P" * 300
+    inv3 = inventory_with(m, acc3, {"s.raw": old}, {"s.raw": md5(old)})
+    publish_file(m, inv3, acc3, "s.raw", old)
+    inv3 = inventory_with(m, acc3, {"s.raw": new}, {"s.raw": md5(new)})
+    saved = tx.curl_one
+
+    def broken(url, out, size, lk):
+        raise tx.Permanent("network down")
+    tx.curl_one = broken
+    try:
+        r = m._fetch_one(acc3, inv3, "s.raw", "ftp", False, 1, 1, 1, 0.0)
+    finally:
+        tx.curl_one = saved
+    ok("get: a failed replacement leaves the archived copy and its record in place",
+       r[0] == "failed" and open(m.ds(acc3, "raw", "s.raw"), "rb").read() == old
+       and m.manifest(acc3)["files"]["s.raw"]["status"] == "ok", r)
+
+    def fetch(url, out, size, lk):
+        open(out, "wb").write(new)
+    tx.curl_one = fetch
+    try:
+        r = m._fetch_one(acc3, inv3, "s.raw", "ftp", False, 1, 1, 1, 0.0)
+    finally:
+        tx.curl_one = saved
+    e = m.manifest(acc3)["files"]["s.raw"]
+    ok("get: a verified replacement is published and the old copy quarantined",
+       r[0] == "ok" and open(m.ds(acc3, "raw", "s.raw"), "rb").read() == new and e["md5"] == md5(new)
+       and e["status"] == "ok" and os.listdir(m.work(acc3, "quarantine")), (r, e))
+
+    # forbidden roots: migrate sources, plan files, hand-edited plans, legacy imports
+    fb = os.path.join(base, "forbidden-area")
+    os.makedirs(os.path.join(fb, acc3), exist_ok=True)
+    victim = os.path.join(fb, acc3, "s.raw")
+    open(victim, "wb").write(new)
+    mf = Mirror(config=cfg_for(root, f'forbidden_roots = ["{fb}"]\n'))
+    ok("migrate --plan: a source under a forbidden root is refused", raises(lambda: mf.migrate_plan([fb]), UsageError))
+    ok("migrate --plan --out: a plan file under a forbidden root is refused",
+       raises(lambda: mf.migrate_plan([os.path.join(base, "nothing-here")], out=os.path.join(fb, "plan.tsv")), UsageError)
+       and not os.path.exists(os.path.join(fb, "plan.tsv")))
+    stv = os.stat(victim)
+    plan_path = os.path.join(base, "edited-plan.tsv")
+    write(plan_path, "class\taccession\tname\tsrc\tdev\tino\tsize\tmtime_ns\tmd5\tdest\n"
+          f"move\t{acc3}\ts.raw\t{victim}\t{stv.st_dev}\t{stv.st_ino}\t{stv.st_size}\t{stv.st_mtime_ns}\t{md5(new)}\traw/s2.raw\n")
+    res = mf.migrate_apply(plan_path)
+    ok("migrate --apply: a hand-edited row with a source under a forbidden root is left alone",
+       res and res[0][2] == "left" and os.path.isfile(victim) and not os.path.islink(victim), res)
+    ok("import-legacy: a directory under a forbidden root is refused",
+       raises(lambda: mf.import_legacy(os.path.join(fb, acc3)), UsageError))
+
+    # configuration layers: site < personal < --config; [stage.hosts] merged pattern by pattern
+    d = os.path.join(base, "layers")
+    site = write(os.path.join(d, "site", "config.toml"), '[paths]\nroot = "/site"\n[globus]\nenabled = true\n'
+                 'dest_collection = "site-uuid"\n[stage.hosts."*hpc*"]\nssh_options = ["-i", "~/.ssh/site_key"]\n'
+                 '[stage.hosts."*other*"]\nssh_options = ["-i", "~/.ssh/other"]\n')
+    write(os.path.join(d, "xdg", "pxd", "config.toml"), '[globus]\ndest_collection = "my-uuid"\n'
+          '[stage.hosts."*hpc*"]\nssh_options = ["-i", "~/.ssh/my_key"]\n')
+    c = Config(env={"PXD_SITE_CONFIG": site, "XDG_CONFIG_HOME": os.path.join(d, "xdg")})
+    ok("config: the personal file overrides the site file", c.get("globus", "dest_collection") == "my-uuid"
+       and c.get("paths", "root") == "/site" and c.get("globus", "enabled") is True, c.rows())
+    ok("config: [stage.hosts] merges pattern by pattern; the personal entry wins",
+       c.stage_options("login.hpc.example")[0] == ["-i", os.path.expanduser("~/.ssh/my_key")]
+       and c.stage_options("x.other.example")[0] == ["-i", os.path.expanduser("~/.ssh/other")], c.get("stage", "hosts"))
+    ok("config: overridden file values are listed", any(k == "globus.dest_collection" for k, _, _ in c.shadowed), c.shadowed)
+    over = write(os.path.join(d, "over.toml"), '[globus]\ndest_collection = "explicit"\n')
+    c = Config(config_file=over, env={"PXD_SITE_CONFIG": site, "XDG_CONFIG_HOME": os.path.join(d, "xdg")})
+    ok("config: --config overrides the personal file", c.get("globus", "dest_collection") == "explicit")
+    ok("config: a missing $PXD_SITE_CONFIG is a usage error",
+       raises(lambda: Config(env={"PXD_SITE_CONFIG": "/nonexistent/site.toml"}, read_user_file=False), UsageError))
+
+
 def run_all(base):
     os.makedirs(base, exist_ok=True)
     config_tests(os.path.join(base, "config"))
@@ -592,6 +865,7 @@ def run_all(base):
     doctor_tests(base)
     transport_tests(base)
     review_tests(base)
+    review4_tests(base)
     config_type_tests(os.path.join(base, "config"))
 
 

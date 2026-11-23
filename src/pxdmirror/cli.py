@@ -25,7 +25,7 @@ from . import __version__
 from . import convert as cv
 from .config import Config
 from .store import Mirror
-from .util import CapacityError, PxdError, UsageError
+from .util import CapacityError, PxdError, UsageError, replaceable
 
 
 def names_of(a):
@@ -83,6 +83,25 @@ def parser():
     return ap
 
 
+INSTALL = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # <install>/src/pxdmirror/cli.py
+
+
+def install_exposure():
+    """[(path, reason)]: the package directory and every directory above it that a user other than root, the
+    package's owner and the caller could rename or change (see util.replaceable)."""
+    pkg = os.path.dirname(os.path.abspath(__file__))
+    try:
+        owner = os.stat(pkg).st_uid
+    except OSError:
+        return []
+    out = replaceable(pkg, {owner})
+    for f in sorted(os.listdir(pkg)):
+        st = os.lstat(os.path.join(pkg, f))
+        if st.st_uid not in (0, owner, os.getuid()) or st.st_mode & 0o022:
+            out.append((os.path.join(pkg, f), "writable for group or other, or owned by another user"))
+    return out
+
+
 def show_config(cfg, as_json):
     creds = {
         "globus-cli login (per user)": os.path.expanduser("~/.globus/cli/storage.db"),
@@ -90,6 +109,8 @@ def show_config(cfg, as_json):
     }
     if as_json:
         print(json.dumps({"version": __version__, "files": cfg.files, "warnings": cfg.warnings,
+                          "shadowed": [{"key": k, "from": a, "by": b} for k, a, b in cfg.shadowed],
+                          "installation": install_exposure(),
                           "values": {k: {"value": v, "source": src} for k, v, src in cfg.rows()},
                           "credential_files": {k: {"path": p, "exists": os.path.exists(p)} for k, p in creds.items()}},
                          indent=1))
@@ -102,8 +123,12 @@ def show_config(cfg, as_json):
         print(f"  {k}: {p} ({'present' if os.path.exists(p) else 'absent'})")
     if not cfg.get("paths", "root"):
         print("warning: paths.root is not set; commands other than config and tools need it")
+    for k, lo, hi in cfg.shadowed:
+        print(f"note: {k} from {lo[5:]} is overridden by {hi}")
     for w in cfg.warnings:
         print(f"warning: {w}")
+    for p, why in install_exposure():
+        print(f"warning: installation {INSTALL}: {p} {why}: another user could replace the pxd you run (docs/PERMISSIONS.md)")
 
 
 def main(argv=None):
@@ -119,7 +144,8 @@ def main(argv=None):
             for n, spec in cv.load_tools(cfg.get("paths", "tools")).items():
                 try:
                     i = cv.identify(n, spec)
-                    print(f"{n}\t{i['version']}\t{i['path']}\tsha256 {i['sha256'][:16]}\t{'REFUSED by default' if spec.get('refused_unless') else ''}")
+                    print(f"{n}\t{i['version']}\t{i['path']}\tsha256 {i['sha256'][:16]}\ttree_sha256 {i['tree_sha256']}"
+                          f"\t{'REFUSED by default' if spec.get('refused_unless') else ''}")
                 except PxdError as e:
                     print(f"{n}\tunavailable here: {e}")
             return 0
@@ -149,7 +175,10 @@ def main(argv=None):
             plan = m.delete_plan(a.acc, a.files, a.dataset, a.derived_only, a.status)
             for kind, key, rel in plan["items"]:
                 print(f"{kind}\t{key}\t{m.root}/{a.acc}/{rel}")
-            print(f"{len(plan['items'])} items; confirmation token {plan['token']}")
+            for g in plan["globus"]:
+                print(f"globus-task\t{g['task']}\t{len(g['files'])} files in flight (deliveries discarded"
+                      f"{', task cancelled' if g['own'] else ''})")
+            print(f"{len(plan['items']) + len(plan['globus'])} items; confirmation token {plan['token']}")
             if not a.yes:
                 print(f"nothing deleted; to delete exactly these: add --yes --confirm {plan['token']}")
                 return 0
@@ -199,6 +228,10 @@ def main(argv=None):
             return 0
         if a.cmd == "doctor":
             r = m.doctor(fix=a.fix)
+            exp = install_exposure()       # a warning: members cannot fix it (needs root-only or sticky parents)
+            r["checks"].append(("installation", "WARNING" if exp else "ok",
+                                f"{exp[0][0]} {exp[0][1]} (+{len(exp) - 1} more): another user could replace pxd"
+                                if exp else f"{INSTALL}: only root and its owner can change it"))
             if a.json:
                 print(json.dumps(r, indent=1))
             else:

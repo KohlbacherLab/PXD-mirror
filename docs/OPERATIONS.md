@@ -25,7 +25,12 @@ at the end. `pxd recover` goes through leftover intents:
   the same user. Tasks of other users are listed with their owner.
 
 Intents are validated first (accession, paths inside the mirror, MD5); an intent that another process is
-working on is skipped. Any member may run `recover`; it exits 1 if something needs attention.
+working on is skipped. Any member may run `recover`, but it acts only on intents the caller wrote: an intent
+names paths (the staging file, the symlink left at a migrated file's old place) that pxd trusts only because
+its owner wrote them, and `.ops` is writable for the whole group. Intents are therefore written `640` (group
+read, owner write), and recover reports other members' intents with their owner instead of acting on them;
+an own intent that is writable for others is not acted on either (`NEEDS ATTENTION`). It exits 1 if
+something needs attention.
 
 ## The catalogue: `pxd reindex`
 
@@ -77,7 +82,7 @@ Re-hashes every recorded file of a data set; mismatches are marked `mismatch` in
 ## Converters: `pxd tools`, `pxd convert`
 
 ```bash
-pxd tools                                            # version, path and sha256 of each registered converter
+pxd tools                                            # version, path, sha256 and tree_sha256 of each converter
 pxd convert PXD000001 --files RUN01.raw --to mzML     # or --to mzPeak; --tool NAME; --threads N
 pxd path PXD000001 RUN01.raw --kind mzML
 ```
@@ -86,7 +91,9 @@ The source is copied to `paths.scratch` and its MD5 checked, the converter runs 
 validated (mzML index offsets, mzPeak zip structure), copied back and published under
 `<PXD>/<format>/<recipe>/`. The catalogue records tool version, executable and deployment hashes, argv,
 environment, host, timing and validation result. A new tool version or different arguments give a new
-recipe, never an overwrite.
+recipe, never an overwrite. A converter whose files another user could change is refused (see
+"Converter registry" in [CONFIGURATION.md](CONFIGURATION.md)), and so is a staging directory that another
+user could replace (`paths.scratch`).
 
 ## Permissions: `pxd doctor`
 

@@ -126,6 +126,62 @@ def own_mode(fd_or_path, mode):
         pass
 
 
+def _uname(uid):
+    try:
+        import pwd
+        return pwd.getpwuid(uid).pw_name
+    except (KeyError, TypeError, OverflowError):
+        return f"uid {uid}"
+
+
+def replaceable(path, trusted=(), ancestors_only=False):
+    """[(path, reason)] for every component of realpath(@p path), from the object itself up to '/', through which
+    a user outside @p trusted (always root and the caller) could change or replace it: an entry owned by somebody
+    else, a file writable for group or other, a directory writable for group or other (above the object a
+    directory with the sticky bit is fine: there only owners rename their own entries). Group write granted by
+    an ACL shows in the group bits (the ACL mask), so it is covered."""
+    trusted = {0, os.getuid()} | set(trusted)
+    out = []
+    p = os.path.realpath(path)
+    first = True
+    while True:
+        try:
+            st = os.lstat(p)
+        except OSError as e:
+            out.append((p, f"cannot be checked ({e.strerror})"))
+            break
+        if not (first and ancestors_only):
+            isdir = stat.S_ISDIR(st.st_mode)
+            if st.st_uid not in trusted:
+                out.append((p, f"owned by {_uname(st.st_uid)}"))
+            elif st.st_mode & 0o022 and not (isdir and not first and st.st_mode & stat.S_ISVTX):
+                out.append((p, f"{'directory' if isdir else 'file'} writable for {'group' if st.st_mode & 0o020 else 'others'}"
+                               + ("" if first or not isdir else " without the sticky bit")))
+        first = False
+        if p == "/":
+            break
+        p = os.path.dirname(p)
+    return out
+
+
+def private_dir(path):
+    """Create (mode 0700) or accept a per-user directory and return its real path, refusing one that somebody
+    else could tamper with: it must be ours, not writable for group or other, and no directory above it may let
+    another user rename it away (a world-writable parent without the sticky bit, such as some /scratch)."""
+    mkdirs(path, 0o700)
+    real = os.path.realpath(path)
+    st = os.lstat(real)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise PxdError(f"{path} is not a directory of yours")
+    if st.st_mode & 0o077:
+        os.chmod(real, stat.S_IMODE(st.st_mode) & ~0o077)        # ours: make it private
+    bad = replaceable(real, ancestors_only=True)
+    if bad:
+        raise PxdError(f"{path}: another user could replace it ({bad[0][0]}: {bad[0][1]}); use a directory below one "
+                       "that only you or root can write, or one with the sticky bit (such as /tmp)")
+    return real
+
+
 def mkdirs(path, mode=None):
     """mkdir -p; every directory created here gets `mode` (default DIR_MODE, e.g. 2770: setgid keeps the group)."""
     mode = DIR_MODE if mode is None else mode
@@ -165,13 +221,15 @@ def capacity_guard(e):
     raise e
 
 
-def atomic_write(path, data):
-    """Write to an exclusive temp in the same directory, fsync, rename over, fsync the directory."""
+def atomic_write(path, data, mode=None):
+    """Write to an exclusive temp in the same directory, fsync, rename over, fsync the directory.
+    @p mode: file mode (default FILE_MODE)."""
+    mode = FILE_MODE if mode is None else mode
     d = os.path.dirname(path)
     tmp = os.path.join(d, f".{os.path.basename(path)}.tmp.{socket.gethostname()}.{os.getpid()}.{time.time_ns()}")
     try:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, FILE_MODE)
-        own_mode(fd, FILE_MODE)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+        own_mode(fd, mode)
         with os.fdopen(fd, "wb") as fh:
             fh.write(data.encode() if isinstance(data, str) else data)
             fh.flush()
@@ -186,8 +244,34 @@ def atomic_write(path, data):
         capacity_guard(e)
 
 
-def write_json(path, obj):
-    atomic_write(path, json.dumps(obj, indent=1, sort_keys=True) + "\n")
+def write_json(path, obj, mode=None):
+    atomic_write(path, json.dumps(obj, indent=1, sort_keys=True) + "\n", mode)
+
+
+def read_own_json(path, what="record"):
+    """(object, owner uid, problem) of a JSON record read through one O_NOFOLLOW descriptor, so the owner and
+    the content belong to the same file. problem is None only if the file is owned by the caller and nobody
+    else may write it (not group- or other-writable): the content is then the caller's own."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None, None, None
+    except OSError as e:
+        raise CorruptRecord(f"unreadable {what} {path}: {e}")
+    with os.fdopen(fd, "rb") as fh:
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise CorruptRecord(f"{what} {path} is not a regular file")
+        try:
+            obj = json.loads(fh.read().decode())
+        except ValueError as e:
+            raise CorruptRecord(f"unreadable {what} {path}: {e}")
+    problem = None
+    if st.st_uid != os.getuid():
+        problem = f"written by {_uname(st.st_uid)}"
+    elif st.st_mode & 0o022:
+        problem = "writable for other users (not written by this version of pxd, or changed since)"
+    return obj, st.st_uid, problem
 
 
 def read_json(path, what="record"):

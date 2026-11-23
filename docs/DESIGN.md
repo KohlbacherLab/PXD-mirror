@@ -54,7 +54,7 @@ implementation does about it.
 | M5 | Checksumless resume | **Adopt.** Files without a PRIDE MD5 always restart from zero; verification states `pride-md5`, `local-baseline`, `unverified`. Adoption needs a PRIDE MD5 match. |
 | M6 | Range cleanup | **Adopt.** Private work dir per object (`.work/<PXD>/partial/<name>.d/`, ranges inside), children reaped in `finally`. |
 | M7 | Conversion output path clash | **Adopt.** `mzML/<recipe>/<stem>.mzML`, `mzPeak/<recipe>/<stem>.mzpeak`; recipe = `<tool>-<version>-<argshash8>`; DB unique (accession, source, format, recipe); `path()` takes a recipe or returns the newest. |
-| M8 | Provenance | **Adopt.** Hash the staged input before conversion; record argv, relevant env (DOTNET_ROOT, LD_LIBRARY_PATH), tool version string, binary sha256 and, for OpenMS vendor builds, the sha256 of the RawFileReader assembly; tool registry is `tools.json` (`paths.tools`, maintainer controlled), copied into the DB at use; optional sha256 pins refuse a changed binary. |
+| M8 | Provenance | **Adopt.** Hash the staged input before conversion; record argv, relevant env (DOTNET_ROOT, LD_LIBRARY_PATH), tool version string, binary sha256 and, for OpenMS vendor builds, the sha256 of the RawFileReader assembly; tool registry is `tools.json` (`paths.tools`, maintainer controlled), copied into the DB at use; optional sha256 pins (executable, deployment files, `tree_sha256` over every file the tool may load) refuse a changed deployment, and a tool whose files others can change is refused (see the threat model below). |
 | M9 | Output validation | **Adopt (stdlib).** mzML: every indexed offset must land on `<spectrum`/`<chromatogram` with the indexed id; spectrum count = index count. mzPeak: zip opens, required members present and non-empty. TRFP 2.0.0 refused unless `--allow-trfp2` (then validated). Validator version recorded. |
 | M10 | Staging overwrite | **Adopt.** Copy to an exclusive temp at the target, verify MD5 there, publish no-overwrite; identical existing = ok, differing = conflict. Remote: rsync to a temp name, remote md5sum, `mv -n`. Fresh dir per unzip. |
 | M11 | Read paths mutate | **Adopt.** query/list/plan/dry-run never write; corrupt manifests are reported, not reset. |
@@ -75,22 +75,37 @@ finds its task by label) and the validator name `pxdstore-validate 1` recorded w
 
 ## Threat model and known limitations
 
-- **Members of the mirror's group are trusted not to attack each other.** They can delete the whole mirror
-  anyway. pxd protects against accidents, crashes, concurrent use and untrusted downloads, and validates the
-  records it reads (paths, accessions, structure), but path checks are done by name: a member who swaps a
-  directory for a symlink between a check and the following operation could redirect a write. Using
-  descriptor-relative operations throughout would close this; it is not done.
+- **Members of the mirror's group can delete or corrupt the mirror's data** (it is group-writable by
+  design), so pxd does not defend the data against them. It does defend the *accounts* of members against
+  each other: nothing a member writes into the mirror makes pxd, run by another member, write outside the
+  mirror or run other code. Concretely: intents are acted on only by their owner (they are written `640` and
+  read through one `O_NOFOLLOW` descriptor that also yields the owner); converters are refused if anything
+  they load is writable by others; conversion staging must be private and not replaceable; records read from
+  the mirror (paths, accessions, structure) are validated. Remaining gaps: path checks inside the mirror are
+  done by name, so a member who swaps a directory for a symlink between a check and the following
+  operation could redirect a write *inside the mirror tree*; descriptor-relative operations would close it.
+  A converter is executed by path after its last check (by then its files can only be changed by root or its
+  maintainer). Group-writable directories above the installation or a converter deployment let a member
+  replace them wholesale; pxd can only warn about that (it needs root-only or sticky parents).
 - **Process-wide settings.** `Mirror(config)` sets the file modes, umask, PRIDE endpoints, Globus and converter
   settings for the whole Python process. Do not use two differently configured mirrors in one process.
 - **Recipes** are `<tool>-<version>-<hash of fixed arguments and deployment files>`; the executable's own
-  hash is recorded but not part of the recipe (existing recipe names stay valid). A rebuilt binary with the
-  same version string, arguments and deployment files therefore maps to the same recipe: give it a new
-  version or tool name.
+  hash and the hash over every file the tool may load (`tree_sha256`) are recorded but not part of the
+  recipe (existing recipe names stay valid). A rebuilt binary with the same version string, arguments and
+  deployment files therefore maps to the same recipe: give it a new version or tool name, or pin
+  `tree_sha256` so that any change is refused until the maintainer decides. `recipe_deployment_sha256` lets a
+  maintainer declare a relinked deployment equivalent; the provenance keeps the actual hashes.
 - **Globus:** two members submitting the same files at the same moment both transfer them (the second
   publication finds an identical file and keeps one). A process killed between Globus accepting a task and
-  pxd writing its intent leaves a task that only `globus task list` shows.
-- **Files without a PRIDE checksum** are recorded with a local MD5 baseline; their size is not checked
-  against the API's (often unreliable) size.
+  pxd writing its intent leaves a task that only `globus task list` shows. An adopted earlier task
+  publishes only the files the current `get` asked for; the rest stay in its inbox (and on the quota)
+  until a `get` asks for them. `delete` lists the tasks still carrying files it deletes (they count in the
+  confirmation token), removes their deliveries, cancels the caller's own tasks when everything they carry
+  is deleted, and records the deletion time, so later deliveries are discarded instead of reviving the
+  data set.
+- **Files without a PRIDE checksum** are recorded with a local MD5 baseline. Over FTP/HTTPS their size is not
+  checked against the API's (often unreliable) size. A Globus delivery of such a file is used only if the
+  task succeeded and the size matches the API's, and it never replaces an archived copy.
 - **Validation** of mzML accepts unindexed files (recorded as `indexed: false`); mzPeak is checked
   structurally only.
 - **Remote staging** needs `rsync`, `md5sum` and POSIX `mv` on the target.

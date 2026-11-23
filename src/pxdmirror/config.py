@@ -5,9 +5,13 @@ Precedence, per key (highest first):
   1. command line (``--root``, ``--scratch``, ``--tools``, ...)
   2. environment: ``PXD_<SECTION>_<KEY>`` (e.g. ``PXD_GLOBUS_DEST_COLLECTION``) and the short aliases
      ``PXD_ROOT``, ``PXD_SCRATCH``, ``PXD_TOOLS``
-  3. ``--config FILE`` or ``$PXD_CONFIG`` (a site or project file)
-  4. ``$XDG_CONFIG_HOME/pxd/config.toml`` (default ``~/.config/pxd/config.toml``)
-  5. built-in defaults (generic and safe: no root, Globus off)
+  3. ``--config FILE`` or ``$PXD_CONFIG`` (an explicitly chosen file)
+  4. ``$XDG_CONFIG_HOME/pxd/config.toml`` (default ``~/.config/pxd/config.toml``), the personal file
+  5. ``$PXD_SITE_CONFIG`` (a shared installation's site file; ``bin/pxd`` sets it to ``<install>/site/config.toml``)
+  6. built-in defaults (generic and safe: no root, Globus off)
+
+Files are merged key by key, and ``[stage.hosts]`` pattern by pattern (a higher file's entry for a pattern
+replaces a lower one's and is matched after it). ``shadowed`` lists file values that a higher layer replaced.
 
 Strings expand ``~``, ``{user}``, ``{home}`` and ``{tmp}`` (the system temporary directory) in path keys.
 Unknown keys produce a warning; a value of the wrong type is a usage error.
@@ -163,14 +167,20 @@ class Config:
 
     def __init__(self, cli=None, config_file=None, env=None, read_user_file=True):
         env = os.environ if env is None else env
-        self.values, self.sources, self.warnings, self.files = {}, {}, [], []
+        self.values, self.sources, self.warnings, self.files, self.shadowed = {}, {}, [], [], []
         for sec, keys in SCHEMA.items():
             for key, (default, *_rest) in keys.items():
                 self._set(sec, key, default, "default")
         layers = []
+        sf = env.get("PXD_SITE_CONFIG")
+        if sf:
+            sf = os.path.abspath(os.path.expanduser(sf))
+            if not os.path.isfile(sf):
+                raise UsageError(f"site config file {sf} ($PXD_SITE_CONFIG) not found")
+            layers.append(sf)
         if read_user_file:
             up = user_config_path(env)
-            if os.path.isfile(up):
+            if os.path.isfile(up) and up not in layers:
                 layers.append(up)
         cf = config_file or env.get("PXD_CONFIG")
         if cf:
@@ -185,7 +195,7 @@ class Config:
         def order(name):                                 # deprecated aliases < short aliases < PXD_SECTION_KEY
             return (0 if name in DEPRECATED else 1 if name in ENV_ALIASES else 2, name)
         for name, val in sorted(env.items(), key=lambda kv: order(kv[0])):
-            if not name.startswith("PXD_") or name == "PXD_CONFIG":
+            if not name.startswith("PXD_") or name in ("PXD_CONFIG", "PXD_SITE_CONFIG"):
                 continue
             if name in ENV_ALIASES:
                 sec, key = ENV_ALIASES[name]
@@ -205,6 +215,9 @@ class Config:
         self._check()
 
     def _set(self, sec, key, val, source):
+        old = self.sources.get((sec, key), "default")
+        if old.startswith("file:") and source != old and self.values.get((sec, key)) != val:
+            self.shadowed.append((f"{sec}.{key}", old, source))
         self.values[(sec, key)] = val
         self.sources[(sec, key)] = source
 
@@ -221,6 +234,9 @@ class Config:
                     continue
                 val = _coerce(sec, key, val, path)
                 if sec == "stage" and key == "hosts":
+                    prev = self.values[(sec, key)] if self.sources[(sec, key)] != "default" else {}
+                    merged = {p: o for p, o in prev.items() if p not in val}     # lower files' other patterns stay
+                    merged.update(val)
                     for pat, opts in val.items():
                         if not isinstance(opts, dict) or set(opts) - {"ssh_options", "rsync_options"}:
                             raise UsageError(f"{path}: stage.hosts.{pat!r} takes ssh_options / rsync_options lists")
@@ -230,6 +246,11 @@ class Config:
                 if sec == "paths" and key == "tools" and val and not os.path.isabs(os.path.expanduser(val)) \
                         and not val.startswith("{"):
                     val = os.path.join(base, val)                  # relative to the config file
+                if sec == "stage" and key == "hosts":
+                    self.values[(sec, key)] = merged
+                    self.sources[(sec, key)] = f"file:{path}" if self.sources[(sec, key)] == "default" else \
+                        f"{self.sources[(sec, key)]} + {path}"
+                    continue
                 self._set(sec, key, val, f"file:{path}")
         tj = os.path.join(base, "tools.json")
         src = self.sources[("paths", "tools")]

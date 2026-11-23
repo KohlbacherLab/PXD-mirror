@@ -2,7 +2,9 @@
 #
 # Where pxd looks (highest precedence first):
 #   command line (--root, --tools)  >  environment (PXD_ROOT, PXD_<SECTION>_<KEY>)  >
-#   --config FILE or $PXD_CONFIG  >  $XDG_CONFIG_HOME/pxd/config.toml (~/.config/pxd/config.toml)  >  defaults
+#   --config FILE or $PXD_CONFIG  >  $XDG_CONFIG_HOME/pxd/config.toml (~/.config/pxd/config.toml)  >
+#   $PXD_SITE_CONFIG (a shared installation's site file; bin/pxd sets it)  >  defaults
+# Files merge key by key ([stage.hosts] pattern by pattern), so a personal file needs only what differs.
 # `pxd config` prints every effective value and where it came from.
 # Path values expand ~, {user}, {home} and {tmp} (the system temporary directory).
 

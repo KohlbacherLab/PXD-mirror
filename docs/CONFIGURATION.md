@@ -11,16 +11,21 @@ For every key, the first of these that sets it wins:
 1. command line: `--root`, `--tools`, and per command `--stage`, `--split`, `--max-attempts`, ...
 2. environment: `PXD_<SECTION>_<KEY>` (for example `PXD_GLOBUS_DEST_COLLECTION`, `PXD_LIMITS_QUOTA_MARGIN_GB`),
    plus the short forms `PXD_ROOT`, `PXD_SCRATCH`, `PXD_TOOLS`
-3. `--config FILE`, else `$PXD_CONFIG` (typically a site file maintained by whoever runs the mirror)
+3. `--config FILE`, else `$PXD_CONFIG` (a file chosen explicitly for one run or project)
 4. `$XDG_CONFIG_HOME/pxd/config.toml`, default `~/.config/pxd/config.toml` (a personal file)
-5. built-in defaults
+5. `$PXD_SITE_CONFIG` (the site file of a shared installation, maintained by whoever runs the mirror)
+6. built-in defaults
 
-Files are merged key by key: a site file can set the root and Globus, and a personal file can add a
-per-host ssh key for staging.
+Files are merged key by key, so a personal file only needs the keys a user wants to differ from the site
+file: for example their own Globus endpoint (`[globus]`) or their own ssh key for staging. `[stage.hosts]`
+is merged pattern by pattern: a personal entry for `"*hpc*"` replaces the site's entry for that pattern
+and is matched after the site's other patterns, so it wins; the site's other patterns stay. `pxd config`
+lists every file value that a higher layer overrides (`note: ... is overridden by ...`).
 
-`bin/pxd` (the wrapper for running from a checkout or a shared installation) sets `PXD_CONFIG` to
-`<installation>/site/config.toml` if that file exists and `PXD_CONFIG` is not set. That is how one shared
-installation gives every user the same settings without a personal file.
+`bin/pxd` (the wrapper for running from a checkout or a shared installation) sets `PXD_SITE_CONFIG` to
+`<installation>/site/config.toml` if that file exists and `PXD_SITE_CONFIG` is not set. That is how one
+shared installation gives every user the same settings without a personal file. `PXD_SITE_CONFIG=""` runs
+without the site file.
 
 List values in environment variables are separated by spaces or commas (`PXD_TRANSFER_METHODS="ftp https"`),
 or given as a JSON array when an element contains spaces (`PXD_GLOBUS_SHARED_PREFIXES='["/shared/My Group"]'`);
@@ -47,9 +52,9 @@ A fully commented file is in [`examples/config.toml`](../examples/config.toml).
 | Key | Default | Env | Meaning |
 |---|---|---|---|
 | `root` | none (required) | `PXD_ROOT` | the mirror root |
-| `scratch` | `{tmp}/pxd-{user}` | `PXD_SCRATCH` | per-user staging for `pxd convert` (created 0700). Use a node-local disk. `convert --stage DIR` overrides it |
+| `scratch` | `{tmp}/pxd-{user}` | `PXD_SCRATCH` | per-user staging for `pxd convert` (created 0700). Use a node-local disk. `convert --stage DIR` overrides it. pxd refuses a staging directory that is not yours, is writable for others, or lies below a directory through which another user could rename it away (a world-writable directory without the sticky bit, as some `/scratch` file systems are set up); `/tmp`-style directories (sticky bit) are fine |
 | `tools` | `tools.json` next to the config file, else none | `PXD_TOOLS` | converter registry ([`examples/tools.json`](../examples/tools.json)) |
-| `forbidden_roots` | `[]` | | directories under which pxd refuses to work (as root) or to stage into, e.g. a backup area |
+| `forbidden_roots` | `[]` | | directories pxd never writes into or changes anything under, symlinks resolved: refused as the mirror root, as a `stage` target, as conversion staging (`paths.scratch`, `convert --stage`), as a `migrate` source (also in a hand-edited plan), as the `migrate --plan --out` file and as an `import-legacy` directory. E.g. a backup area |
 
 The layout below the root (`PXDnnnnnn/`, `.locks/`, `.ops/`, `.work/`, `catalog.sqlite`, `.events.jsonl`) is
 fixed and cannot be configured.
@@ -132,6 +137,33 @@ Host aliases and keys in `~/.ssh/config` work as usual, so per-host options are 
 `PXD_TEST_HTTPS_PREFIX` still work as aliases of `paths.tools`, `pride.api`, `globus.cli`,
 `globus.dest_collection` and `pride.https_base`.
 
+## Converter registry (`tools.json`)
+
+`paths.tools` names a JSON file with one entry per converter; [`examples/tools.json`](../examples/tools.json)
+is a template. Per converter:
+
+| Key | Meaning |
+|---|---|
+| `path` | the executable; `~` and `${VAR}` expand (from `env`, then the environment) |
+| `env` | environment for the converter (e.g. `DOTNET_ROOT`, `LD_LIBRARY_PATH`); recorded in the provenance, so never put secrets here |
+| `version_args`, `version_regex` | how pxd reads the version that goes into the recipe name |
+| `argv` | `{format: [arguments]}` with the placeholders `{in}`, `{out}`, `{threads}` |
+| `default_for` | `{format: [input suffixes]}` for which this converter is the default |
+| `deploy_root` | `"prefix"`: the deployment is the directory above `bin/`; default: the executable's directory |
+| `deployment_files` | files (relative to the deployment) whose sha256 goes into the recipe, e.g. a vendor reader library |
+| `sha256`, `deployment_sha256` | optional pins of the executable and of the deployment files; a mismatch refuses the tool |
+| `tree_sha256` | optional pin over every file the converter may load (`pxd tools` prints it); catches a changed library that is not listed |
+| `recipe_deployment_sha256` | `{file: earlier sha256}`: the maintainer declares a relinked or moved deployment equivalent, so the recipe name (and with it existing conversions) stays; the provenance still records the actual hashes |
+| `refused_unless`, `why` | `"allow_trfp2"`: the tool runs only with `convert --allow-trfp2` |
+
+Before every conversion pxd checks what the converter may load: the deployment directory, every directory
+named in `env`, and (on Linux) every shared library `ldd` resolves. Everything there must be owned by root,
+by the owner of `tools.json` or by the caller, and must not be writable for group or other; otherwise the
+tool is refused. A group-writable directory *above* a deployment (which would let a member rename the whole
+deployment away) is reported as a warning. The files are fingerprinted (inode, size, times, mode, owner), so a
+converter that changes while pxd runs is hashed again (and refused if a pin no longer matches) before it
+runs. Do not name directories in `env` that others can write (for example `/tmp` or a group work area).
+
 ## Examples
 
 ### 1. Single user on a laptop
@@ -152,7 +184,7 @@ pxd init && pxd get PXD000001 --category RAW
 ### 2. Shared group mirror on a cluster file system
 
 One maintainer installs the package in a directory only maintainers can write and puts the site file in
-`<installation>/site/config.toml` (or anywhere, with `PXD_CONFIG` set in the group's shell profile):
+`<installation>/site/config.toml` (or anywhere, with `PXD_SITE_CONFIG` set in the group's shell profile):
 
 ```toml
 [site]
@@ -160,7 +192,7 @@ name = "PRIDE mirror of the proteomics group"
 
 [paths]
 root = "/shared/proteomics/pxd"
-scratch = "/scratch/{user}/pxd"              # node-local disk for conversions
+scratch = "/tmp/pxd-{user}"                 # node-local disk for conversions (see paths.scratch)
 tools = "tools.json"                         # next to this file
 forbidden_roots = ["/shared/backup"]
 

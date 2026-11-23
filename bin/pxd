@@ -1,7 +1,9 @@
 #!/bin/sh
 # Run pxd from a checkout (or an unpacked copy) without installing it.
 #   PXD_PYTHON   interpreter (default python3; needs Python >= 3.11)
-#   PXD_CONFIG   configuration file; if unset and <checkout>/site/config.toml exists, that file is used
+#   PXD_SITE_CONFIG  site file (lowest-precedence configuration file); if unset and <checkout>/site/config.toml
+#                exists, that file is used. Set it to an empty string to use no site file.
+#   PXD_CONFIG   an explicitly chosen configuration file (above the personal ~/.config/pxd/config.toml)
 set -eu
 unset CDPATH
 self=$0
@@ -10,8 +12,8 @@ while [ -L "$self" ]; do                      # follow symlinks such as ~/bin/px
     case $link in /*) self=$link ;; *) self=$(dirname "$self")/$link ;; esac
 done
 here=$(cd "$(dirname "$self")/.." && pwd -P)
-if [ -z "${PXD_CONFIG:-}" ] && [ -f "$here/site/config.toml" ]; then
-    PXD_CONFIG=$here/site/config.toml
-    export PXD_CONFIG
+if [ -z "${PXD_SITE_CONFIG+set}" ] && [ -f "$here/site/config.toml" ]; then
+    PXD_SITE_CONFIG=$here/site/config.toml
+    export PXD_SITE_CONFIG
 fi
 exec "${PXD_PYTHON:-python3}" -I -c 'import sys; sys.path.insert(0, sys.argv.pop(1)); from pxdmirror.cli import run; run()' "$here/src" "$@"

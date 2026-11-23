@@ -4,9 +4,9 @@ Provenance per conversion: tool name, version string (from the tool), sha256 of 
 deployment files listed in tools.json (e.g. the RawFileReader assembly), argv, relevant environment, host,
 staged-input MD5, output MD5, validator name/version and result. recipe = <tool>-<version>-<argshash8>
 (paths and thread counts are not part of the hash), so two recipes never share an output path."""
-import hashlib, json, os, re, subprocess, zipfile
+import hashlib, json, os, re, shutil, stat, subprocess, sys, zipfile
 
-from .util import PxdError, UsageError, sha256sum
+from .util import PxdError, UsageError, log, replaceable, sha256sum
 
 TOOLS_JSON = ""          # paths.tools (Mirror(config) sets it); empty: no converters configured
 VALIDATOR = "pxdstore-validate 1"
@@ -30,6 +30,7 @@ def load_tools(path=None):
     try:
         with open(path) as fh:
             tools = json.load(fh)
+            owner = os.fstat(fh.fileno()).st_uid
     except FileNotFoundError:
         raise UsageError(f"converter registry {path} not found (paths.tools)")
     except ValueError as e:
@@ -43,19 +44,145 @@ def load_tools(path=None):
         spec["env"] = env
         spec["path"] = _expand(spec["path"], env)
         spec["deployment_files"] = [_expand(x, env) for x in spec.get("deployment_files", [])]
+        spec["_registry_uid"] = owner          # the maintainer: trusted like root and the caller (see trust_scan)
     return {n: s for n, s in tools.items() if not n.startswith("_")}
 
 
 _ID = {}
+_WARNED = set()
+
+
+def deploy_root(spec):
+    exe = spec["path"]
+    return os.path.dirname(os.path.dirname(exe)) if spec.get("deploy_root") == "prefix" else os.path.dirname(exe)
+
+
+def _dep_path(spec, rel):
+    return rel if rel.startswith("/") else os.path.join(deploy_root(spec), rel)
+
+
+def trees(spec):
+    """Directories whose whole content a tool may load: its deployment root and every absolute directory named in
+    its env block (DOTNET_ROOT, LD_LIBRARY_PATH entries, ...), symlinks resolved, nested ones dropped."""
+    cand = [deploy_root(spec)]
+    for v in (spec.get("env") or {}).values():
+        cand += [x for x in str(v).split(os.pathsep) if x.startswith("/") and os.path.isdir(x)]
+    real = sorted({os.path.realpath(t) for t in cand})
+    return [t for t in real if not any(t != u and t.startswith(u.rstrip("/") + "/") for u in real)]
+
+
+def _in(path, roots):
+    return any(path == r or path.startswith(r.rstrip("/") + "/") for r in roots)
+
+
+def _ldd(paths, env):
+    """Shared libraries the dynamic loader resolves for @p paths (Linux ldd; [] elsewhere or for scripts)."""
+    if not sys.platform.startswith("linux") or not shutil.which("ldd"):
+        return []
+    out = set()
+    for p in paths:
+        try:
+            r = subprocess.run(["ldd", p], capture_output=True, text=True, env=env, timeout=120)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if r.returncode:
+            continue                                    # not a dynamic ELF (a script, a .dll)
+        for line in r.stdout.splitlines():
+            m = re.search(r"(?:=>\s*)?(/\S+)\s+\(0x", line)
+            if m:
+                out.add(os.path.realpath(m.group(1)))
+    return sorted(out)
+
+
+def trust_scan(name, spec, extras=None):
+    """(errors, warnings, entries, extras): what a user other than root, the registry's owner and the caller could
+    change in what the tool runs. Every entry below its trees() must be owned by one of them and must not be
+    writable for group or other; so must every library or symlink target outside the trees (and its directory).
+    Directories above those (e.g. a group-writable parent) are reported as warnings: they let a member rename
+    the whole deployment away, which only a sticky bit or root-only parents prevent. @p extras: libraries
+    found by ldd before (else determined here). entries: [(path, lstat)] for the fingerprint."""
+    trusted = {spec.get("_registry_uid", os.getuid())}
+    errors, warnings, entries, outside = [], set(), [], set()
+    roots = trees(spec)
+
+    def bad(p, st):
+        if st.st_uid not in trusted | {0, os.getuid()}:
+            return "owned by another user"
+        if st.st_mode & 0o022:
+            return f"writable for {'group' if st.st_mode & 0o020 else 'others'}"
+        return None
+    for t in roots:
+        for p, why in replaceable(t, trusted, ancestors_only=True):
+            warnings.add(f"{p}: {why}")
+        for dp, dns, fns in os.walk(t):
+            for n in [None] + dns + fns:
+                p = dp if n is None else os.path.join(dp, n)
+                try:
+                    st = os.lstat(p)
+                except OSError:
+                    continue
+                if stat.S_ISDIR(st.st_mode) and n is not None:
+                    continue                            # visited as dp
+                if stat.S_ISLNK(st.st_mode):
+                    tgt = os.path.realpath(p)
+                    if not _in(tgt, roots):
+                        outside.add(tgt)
+                    continue
+                why = bad(p, st)
+                if why:
+                    errors.append(f"{p} {why}")
+                entries.append((p, st))
+    for p in [spec["path"]] + [_dep_path(spec, r) for r in spec.get("deployment_files", [])]:
+        rp = os.path.realpath(p)
+        if os.path.exists(rp) and not _in(rp, roots):
+            outside.add(rp)
+    if extras is None:
+        env = dict(os.environ, **(spec.get("env") or {}))
+        extras = _ldd([spec["path"]] + [_dep_path(spec, r) for r in spec.get("deployment_files", [])], env) if not errors else []
+    outside |= {x for x in extras if not _in(x, roots)}
+    for x in sorted(outside):
+        for p, why in replaceable(x, trusted):
+            (errors.append(f"{p} {why}") if p in (x, os.path.dirname(x)) else warnings.add(f"{p}: {why}"))
+        try:
+            entries.append((x, os.stat(x)))
+        except OSError:
+            pass
+    return errors, sorted(warnings), entries, extras
+
+
+def _fingerprint(entries):
+    return hashlib.sha256(json.dumps([(p, st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_mode,
+                                       st.st_uid) for p, st in sorted(entries, key=lambda e: e[0])]).encode()).hexdigest()
+
+
+def tree_hash(entries):
+    """sha256 over (path, sha256) of every regular file a tool may load (its trees and outside libraries)."""
+    h = hashlib.sha256()
+    for p, st in sorted(entries, key=lambda e: e[0]):
+        if stat.S_ISREG(st.st_mode):
+            h.update(f"{p}\t{sha256sum(p)}\n".encode())
+    return h.hexdigest()
 
 
 def identify(name, spec):
-    """Version string and hashes of one deployment (cached per process). A "sha256" pinned in the registry
-    (executable) or "deployment_sha256" ({file: sha256}) must match, else the tool is refused."""
+    """Version string and hashes of one deployment. Refuses a tool that another user could change (trust_scan) or
+    whose pins do not match: "sha256" (executable), "deployment_sha256" ({file: sha256}), "tree_sha256" (all
+    files the tool may load, see tree_hash). Called before every conversion: the result is cached per process
+    only while nothing in the deployment changed (inode, size, times, mode, owner of every entry)."""
     exe = spec["path"]
-    key = (name, exe, spec.get("sha256"), json.dumps(spec.get("deployment_sha256"), sort_keys=True))
-    if key in _ID:
-        return _ID[key]
+    key = (name, exe, spec.get("sha256"), json.dumps(spec.get("deployment_sha256"), sort_keys=True), spec.get("tree_sha256"))
+    cached = _ID.get(key)
+    errors, warnings, entries, extras = trust_scan(name, spec, cached["extras"] if cached else None)
+    if errors:
+        raise PxdError(f"tool {name}: {len(errors)} entries another user could change, e.g. {'; '.join(errors[:3])}; "
+                       "refused (install converters where only maintainers can write: docs/PERMISSIONS.md)")
+    for w in warnings:
+        if (name, w) not in _WARNED:
+            _WARNED.add((name, w))
+            log(f"warning: tool {name}: {w}: another user could replace the whole deployment (docs/PERMISSIONS.md)")
+    fp = _fingerprint(entries)
+    if cached and cached["fp"] == fp:
+        return cached["ident"]
     if not os.access(exe, os.X_OK):
         raise PxdError(f"tool {name}: {exe} not executable here")
     digest = sha256sum(exe)
@@ -63,24 +190,36 @@ def identify(name, spec):
         raise PxdError(f"tool {name}: {exe} sha256 {digest[:16]}... does not match the registry ({spec['sha256'][:16]}...); refused")
     dep = {}
     for rel in spec.get("deployment_files", []):
-        p = rel if rel.startswith("/") else os.path.join(os.path.dirname(os.path.dirname(exe)) if spec.get("deploy_root") == "prefix" else os.path.dirname(exe), rel)
+        p = _dep_path(spec, rel)
         dep[rel] = sha256sum(p) if os.path.exists(p) else "missing"
         pin = (spec.get("deployment_sha256") or {}).get(rel)
         if pin and pin != dep[rel]:
             raise PxdError(f"tool {name}: deployment file {rel} does not match its pinned sha256; refused")
+    th = tree_hash(entries)
+    if spec.get("tree_sha256") and spec["tree_sha256"] != th:
+        raise PxdError(f"tool {name}: the files it may load changed (tree sha256 {th[:16]}... != pinned "
+                       f"{spec['tree_sha256'][:16]}...); refused")
     env = dict(os.environ, **spec.get("env", {}))
     r = subprocess.run([exe] + spec["version_args"], capture_output=True, text=True, env=env, timeout=300)
     m = re.search(spec["version_regex"], (r.stdout or "") + (r.stderr or ""))
     if not m:
         raise PxdError(f"tool {name}: no version in the output of {spec['version_args']}")
-    _ID[key] = {"name": name, "version": " ".join(g.strip() for g in m.groups() if g) or m.group(0), "path": exe,
-                 "sha256": digest, "deployment": dep, "env": spec.get("env", {})}
-    return _ID[key]
+    ident = {"name": name, "version": " ".join(g.strip() for g in m.groups() if g) or m.group(0), "path": exe,
+             "sha256": digest, "deployment": dep, "tree_sha256": th, "env": spec.get("env", {})}
+    if fp != _fingerprint(trust_scan(name, spec, extras)[2]):
+        raise PxdError(f"tool {name}: its deployment changed while it was being identified; try again")
+    _ID[key] = {"fp": fp, "extras": extras, "ident": ident}
+    return ident
 
 
 def recipe(name, ident, spec, fmt):
+    """<tool>-<version>-<hash of format, fixed arguments and deployment files>. A maintainer who relinks or moves a
+    deployment without changing what it computes may declare that in "recipe_deployment_sha256" ({file: the
+    earlier sha256}): the recipe name then stays, while the provenance records the actual hashes."""
     fixed = [a for a in spec["argv"][fmt] if a not in ("{in}", "{out}", "{threads}")]
-    h = hashlib.sha256(json.dumps([fmt, fixed, sorted(ident["deployment"].items())]).encode()).hexdigest()[:8]
+    same = spec.get("recipe_deployment_sha256") or {}
+    dep = {k: same.get(k, v) for k, v in ident["deployment"].items()}
+    h = hashlib.sha256(json.dumps([fmt, fixed, sorted(dep.items())]).encode()).hexdigest()[:8]
     v = re.sub(r"[^A-Za-z0-9.]+", "-", ident["version"])[:40].strip("-")
     return f"{name}-{v}-{h}"
 

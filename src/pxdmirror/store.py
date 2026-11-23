@@ -11,8 +11,8 @@ from . import convert as cv, inventory as inv_mod, transfer as tx, util as U
 from .catalog import Catalog
 from .config import Config
 from .util import (ACC_RE, own_mode, current_umask, CapacityError, CorruptRecord, PxdError, UsageError, append_line, atomic_write, capacity_guard,
-                   check_acc, flock, fsync_dir, inside, log, md5sum, mkdirs, now, opid, quota_free, read_json,
-                   safe_name, safe_rel, user, write_json)
+                   check_acc, flock, fsync_dir, inside, log, md5sum, mkdirs, now, opid, private_dir, quota_free, read_json,
+                   read_own_json, replaceable, safe_name, safe_rel, user, write_json)
 
 README = """# {name}
 
@@ -88,6 +88,12 @@ class Mirror:
 
     def _file_lock(self, acc, key, wait=0.0):
         return flock(os.path.join(self.root, ".locks", acc, safe_name(key) + ".lock"), True, wait)
+
+    def _refuse_forbidden(self, path, what):
+        """UsageError if @p path (symlinks resolved) is under one of paths.forbidden_roots."""
+        bad = _under(path, self.cfg.get("paths", "forbidden_roots"))
+        if bad:
+            raise UsageError(f"{what} {path} is under the forbidden root {bad} (paths.forbidden_roots)")
 
     def _need_root(self):
         if not os.path.isdir(os.path.join(self.root, ".ops")):
@@ -199,6 +205,12 @@ class Mirror:
             raise PxdError(f"copy of {staged} does not match {want}; original left in place")
         return cpy
 
+    @staticmethod
+    def _intent_mode():
+        """Intents are readable for the group (recover reports them) but writable only by their owner: an intent
+        is acted on only by the user who wrote it (read_own_json)."""
+        return U.FILE_MODE & ~0o022
+
     def _intent_lock_path(self, oid):
         return os.path.join(self.root, ".locks", "ops", safe_name(oid) + ".lock")
 
@@ -235,7 +247,8 @@ class Mirror:
         with self._intent_lock(oid):
             write_json(ipath, {"op": oid, "kind": "publish", "accession": acc, "rel": rel, "staged": staged,
                                "md5": record["entry"].get("md5") or record["entry"].get("output_md5"),
-                               "record": record, "backlink": backlink, "created": now(), "host": socket.gethostname()})
+                               "record": record, "backlink": backlink, "created": now(), "host": socket.gethostname(),
+                               "user": user()}, self._intent_mode())
             try:
                 os.link(staged, dest)
             except FileExistsError:
@@ -287,7 +300,7 @@ class Mirror:
         out = []
         for ip in sorted(glob.glob(os.path.join(self.root, ".ops", "*.json"))):
             try:
-                it = read_json(ip, "intent")
+                it, owner, problem = read_own_json(ip, "intent")
             except (CorruptRecord, OSError) as e:
                 out.append((os.path.basename(ip), f"NEEDS ATTENTION: {e}"))
                 continue
@@ -295,6 +308,17 @@ class Mirror:
                 continue                                   # finished meanwhile by another process
             if not isinstance(it, dict):
                 out.append((os.path.basename(ip), "NEEDS ATTENTION: intent is not a JSON object"))
+                continue
+            op = str(it.get("op") or os.path.basename(ip))
+            if owner != os.getuid():
+                # only the owner acts on an intent: its paths (staging file, symlink back) are trusted only because
+                # the owner wrote them; .ops is writable for the whole group
+                what = f"globus task {it.get('task')}" if it.get("kind") == "globus" else f"{it.get('kind')} intent"
+                out.append((op, f"{what} of {_uname(owner)}: only its owner can finish it (they run pxd recover)"))
+                continue
+            if problem:
+                out.append((op, f"NEEDS ATTENTION: intent {problem}; not acted on (check its content, then chmod 640 "
+                                "it to have recover finish it, or remove it)"))
                 continue
             try:
                 out.append(self._recover_one(ip, it))
@@ -307,10 +331,6 @@ class Mirror:
     def _recover_one(self, ip, it):
         op = str(it.get("op") or os.path.basename(ip))
         if it.get("kind") == "globus":
-            owner = self._intent_owner(ip, it)
-            if owner != os.getuid():
-                return (op, f"globus task {it.get('task')} of {it.get('user') or _uname(owner)} "
-                            "(only its owner can follow the task: they run pxd recover / get)")
             try:
                 left = len(os.listdir(it["inbox"])) if os.path.isdir(it["inbox"]) else 0
             except OSError:
@@ -352,16 +372,6 @@ class Mirror:
                 self._drop_intent(ip, op)
                 return (op, f"republished {acc}/{rel}")
             return (op, f"NEEDS ATTENTION: {acc}/{rel} (dest and staged copy do not match {it['md5']})")
-
-    @staticmethod
-    def _intent_owner(ip, it):
-        """uid recorded in a Globus intent (older intents: the intent file's owner)."""
-        if isinstance(it.get("uid"), int):
-            return it["uid"]
-        try:
-            return os.stat(ip).st_uid
-        except OSError:
-            return -1
 
     # ---------------------------------------------------------------- query / list
     def query(self, acc, files=False):
@@ -491,6 +501,7 @@ class Mirror:
         os.rename(path, dst)
         self._event("quarantine", acc, {"file": os.path.basename(path), "why": why, "to": dst})
         log(f"quarantined {os.path.basename(path)} ({why}) -> {dst}")
+        return dst
 
     def _file_entry(self, inv, name, path, md5, method, attempts=0, url=None, seconds=None, verification=None, extra=None):
         frec = inv["files"][name]
@@ -520,6 +531,7 @@ class Mirror:
         with self._file_lock(acc, name) as lk:
             if lk is None:
                 return ("locked", "another process holds this file")
+            replace = None                                  # why the archived copy goes, once a verified one is here
             if os.path.exists(final):
                 st = os.stat(final)
                 if (entry.get("status") == "ok" and entry.get("size") == st.st_size and entry.get("mtime_ns") == st.st_mtime_ns
@@ -533,7 +545,7 @@ class Mirror:
                     return ("skip", "adopted (PRIDE md5)")
                 if not want_md5 and entry.get("status") == "ok" and entry.get("md5") == local:
                     return ("skip", "local baseline")
-                self._quarantine(acc, final, "does not match PRIDE md5" if want_md5 else "no PRIDE md5 and no recorded baseline")
+                replace = "does not match PRIDE md5" if want_md5 else "no PRIDE md5 and no recorded baseline"
             urls = inv_mod.urls_for(frec)
             auto = [x for x in self.cfg.get("transfer", "methods") if x != "globus"]
             order = {"auto": auto, "globus": [], "https": ["https"], "ftp": ["ftp"]}[method]
@@ -569,6 +581,8 @@ class Mirror:
                             bad_md5 = local
                             raise tx.Unresumable(f"md5 {local} != PRIDE {want_md5}")
                         e = self._file_entry(inv, name, part, local, m, total, urls[m], round(time.time() - t0, 1))
+                        if replace and os.path.lexists(final):
+                            self._replace_out(acc, name, final, replace)
                         self.publish(acc, part, f"raw/{name}", {"kind": "file", "key": name, "entry": e})
                         shutil.rmtree(wd, ignore_errors=True)
                         log(f"ok {name} via {m} ({got / 1e6:.1f} MB)")
@@ -609,11 +623,12 @@ class Mirror:
         done, blocked = set(), set()
         for ip in sorted(glob.glob(os.path.join(self.root, ".ops", "globus-*.json"))):
             try:
-                it = read_json(ip, "intent")
-            except (FileNotFoundError, CorruptRecord) as e:
-                if isinstance(e, CorruptRecord):
-                    log(f"{os.path.basename(ip)} unreadable, ignored here (pxd recover reports it): {e}")
-                continue                                   # FileNotFoundError: finished by a concurrent get
+                it, owner, problem = read_own_json(ip, "intent")
+            except CorruptRecord as e:
+                log(f"{os.path.basename(ip)} unreadable, ignored here (pxd recover reports it): {e}")
+                continue
+            if it is None:
+                continue                                   # finished by a concurrent get
             if (not isinstance(it, dict) or it.get("kind") != "globus" or it.get("accession") != acc
                     or not isinstance(it.get("files"), list) or not all(isinstance(n, str) for n in it["files"])
                     or not set(it["files"]) & set(names)
@@ -625,16 +640,18 @@ class Mirror:
             except (PxdError, TypeError) as e:
                 log(f"{os.path.basename(ip)}: invalid Globus intent ignored ({e})")
                 continue
-            owner = self._intent_owner(ip, it)
-            if owner != os.getuid() or it.get("dest_collection", tx.G["dest"]) != tx.G["dest"]:
-                log(f"globus task {it['task']} ({os.path.basename(ip)}) belongs to {it.get('user') or _uname(owner)} or another destination; "
-                    f"not adopted (only its owner can follow it): its {len(set(it['files']) & set(names))} files are fetched anew")
+            if owner != os.getuid() or problem or it.get("dest_collection", tx.G["dest"]) != tx.G["dest"]:
+                log(f"globus task {it['task']} ({os.path.basename(ip)}) belongs to {_uname(owner)}, is writable for others "
+                    f"or uses another destination; not adopted: its {len(set(it['files']) & set(names))} files are fetched anew")
                 continue
+            if all(self._deleted_since(acc, n, it.get("created")) for n in set(it["files"]) & set(names)):
+                log(f"globus task {it['task']}: its files were deleted after it was submitted; not waited for")
+                continue                                   # its deliveries are discarded when they are collected
             status = tx.globus_status(it["task"])
             if status not in ("SUCCEEDED", "FAILED", "CANCELED", "CANCELLED"):
                 status = tx.globus_wait(it["task"], hours)
             log(f"globus task {it['task']} of an earlier get: {status}; publishing {it['inbox']}")
-            d, b = self._globus_collect(acc, inv, ip, it, "FAILED" if status in ("CANCELED", "CANCELLED") else status)
+            d, b = self._globus_collect(acc, inv, ip, it, "FAILED" if status in ("CANCELED", "CANCELLED") else status, names)
             done |= d
             blocked |= b
         names = [n for n in names if n not in done and n not in blocked]
@@ -656,32 +673,54 @@ class Mirror:
         it = {"op": oid, "kind": "globus", "task": task, "accession": acc, "inbox": inbox,
               "files": [os.path.basename(d) for _, d in pairs], "created": now(), "user": user(), "uid": os.getuid(),
               "dest_collection": tx.G["dest"]}
-        write_json(ipath, it)
+        write_json(ipath, it, self._intent_mode())
         log(f"globus task {task}: {len(pairs)} files -> {inbox}")
         d, b = self._globus_collect(acc, inv, ipath, it, tx.globus_wait(task, hours))
         return done | d, blocked | b
 
-    def _globus_collect(self, acc, inv, ipath, it, status):
-        """Verify and publish what the task `it` delivered into its inbox; the intent is removed once the task is
-        over and its inbox is empty. Returns (published names, names blocked because the task may still run)."""
+    def _globus_collect(self, acc, inv, ipath, it, status, names=None):
+        """Verify and publish what the task `it` delivered into its inbox; only the files in @p names (default: all of
+        the task) are published now, the others stay in the inbox for the get that asks for them. The intent is
+        removed once the task is over and its inbox is empty. A delivery is published only if it matches PRIDE's
+        MD5, or, for a file without a PRIDE checksum, if the task SUCCEEDED and the size matches PRIDE's and no
+        other copy is archived. Deliveries of files deleted after the task was submitted are discarded.
+        Returns (published names, names blocked because the task may still run)."""
         if status not in ("SUCCEEDED", "FAILED"):
             log(f"globus task {it['task']} still {status}: its files are not retried now (pxd recover, then get again)")
             return set(), set(it["files"])
         inbox, done = it["inbox"], set()
+        sel = set(it["files"]) if names is None else set(it["files"]) & set(names)
         for n in it["files"]:
             d = os.path.join(inbox, n)
-            if not os.path.isfile(d) or n not in inv["files"]:
+            if n not in sel or not os.path.isfile(d) or n not in inv["files"]:
                 continue
             with self._file_lock(acc, n, wait=600) as lk:
                 if lk is None or not os.path.isfile(d):
                     continue
-                want_md5, want_size = inv["checksums"].get(n, (None, None))
-                local = md5sum(d)
-                if (want_md5 and local != want_md5) or (want_size is not None and os.path.getsize(d) != want_size):
-                    self._quarantine(acc, d, "globus delivery does not match PRIDE")
+                if self._deleted_since(acc, n, it.get("created")):
+                    try:
+                        os.unlink(d)
+                        log(f"{n}: deleted from the mirror after Globus task {it['task']} was submitted; delivery discarded")
+                    except OSError as e:
+                        log(f"{n}: deleted after Globus task {it['task']} was submitted; could not discard {d} ({e})")
                     continue
+                want_md5, want_size = inv["checksums"].get(n, (None, None))
+                api_size = int(inv["files"][n].get("fileSizeBytes") or -1)
+                size = os.path.getsize(d)
+                if want_md5:
+                    local = md5sum(d)
+                    if local != want_md5 or (want_size is not None and size != want_size):
+                        self._quarantine(acc, d, "globus delivery does not match PRIDE")
+                        continue
+                elif status != "SUCCEEDED" or (api_size >= 0 and size != api_size):
+                    self._quarantine(acc, d, f"no PRIDE checksum and the Globus task {status.lower()}"
+                                     if status != "SUCCEEDED" else f"no PRIDE checksum and size {size} != PRIDE {api_size}")
+                    continue
+                else:
+                    local = md5sum(d)
                 final = self.ds(acc, "raw", n)
-                if os.path.isfile(final) and not os.path.islink(final) and md5sum(final) == local:
+                fmd5 = md5sum(final) if os.path.isfile(final) and not os.path.islink(final) else None
+                if fmd5 == local:
                     rec = self.manifest(acc)["files"].get(n, {})
                     if rec.get("status") != "ok" or rec.get("md5") != local:
                         e = self._file_entry(inv, n, final, local, rec.get("method", "adopted"))
@@ -690,8 +729,11 @@ class Mirror:
                     os.unlink(d)
                     done.add(n)
                     continue
-                if os.path.lexists(final):              # an older copy that no longer matches PRIDE
-                    self._quarantine(acc, final, "replaced by a Globus delivery matching the current PRIDE md5")
+                if os.path.lexists(final):
+                    if not want_md5:                # nothing tells which copy is right: keep the archived one
+                        self._quarantine(acc, d, "no PRIDE checksum and a different copy is already archived")
+                        continue
+                    self._replace_out(acc, n, final, "replaced by a Globus delivery matching the current PRIDE md5")
                 e = self._file_entry(inv, n, d, local, "globus", 1, f"{tx.G['source']}:{inv_mod.urls_for(inv['files'][n])['globus']}")
                 self.publish(acc, d, f"raw/{n}", {"kind": "file", "key": n, "entry": e}, allow_copy=True)
                 done.add(n)
@@ -700,13 +742,36 @@ class Mirror:
         except FileNotFoundError:
             pass
         except OSError:
-            log(f"globus task {it['task']}: files left in {inbox}; intent kept for the next get")
+            left = len(set(it["files"]) - sel)
+            log(f"globus task {it['task']}: files left in {inbox}" + (f" ({left} not requested by this get)" if left else "")
+                + "; intent kept for the next get")
             return done, set()
         try:
             os.unlink(ipath)
         except FileNotFoundError:
             pass
         return done, set()
+
+    def _deleted_since(self, acc, name, created):
+        """True if @p name (or the whole data set) was deleted at or after the time @p created (ISO, UTC)."""
+        try:
+            m = self.manifest(acc)
+        except CorruptRecord:
+            return False
+        t = [m.get("deleted")] if m.get("status") == "deleted" else []
+        f = m["files"].get(name) or {}
+        if f.get("status") == "deleted":
+            t.append(f.get("deleted"))
+        return any(isinstance(x, str) and (not isinstance(created, str) or x >= created) for x in t)
+
+    def _replace_out(self, acc, name, final, why):
+        """Move the archived copy of @p name aside (quarantine) right before its verified replacement is
+        published, and mark the manifest entry accordingly, so a crash in between leaves a truthful record."""
+        q = self._quarantine(acc, final, why)
+        def mark(m):
+            if name in m["files"]:
+                m["files"][name].update(status="quarantined", quarantined=now(), quarantine_path=q)
+        self._update_manifest(acc, mark)
 
     # ---------------------------------------------------------------- delete (C2)
     def delete_plan(self, acc, files=None, dataset=False, derived_only=False, status="ok"):
@@ -727,8 +792,36 @@ class Mirror:
             if ((dataset or not names or c["source_name"] in names) and c.get("status") == status and c.get("output_path")
                     and os.path.lexists(os.path.join(self.root, acc, safe_rel(c["output_path"])))):
                 items.append(("conversion", cid, c["output_path"]))
-        token = hashlib.sha256("\n".join([acc] + [f"{k}\t{key}\t{p}" for k, key, p in items]).encode()).hexdigest()[:12]
-        return {"accession": acc, "items": items, "token": token, "dataset": dataset}
+        globus = []                                   # Globus tasks that may still deliver what is deleted
+        if not derived_only:
+            for ip, it, owner, problem in self._globus_intents(acc):
+                hit = sorted(set(it["files"]) if dataset else set(it["files"]) & names)
+                if hit:
+                    globus.append({"op": it.get("op") or os.path.basename(ip)[:-5], "task": it["task"], "owner": owner,
+                                   "files": hit, "inbox": it["inbox"], "intent": ip, "own": owner == os.getuid() and not problem})
+        token = hashlib.sha256("\n".join([acc] + [f"{k}\t{key}\t{p}" for k, key, p in items]
+                                          + [f"globus\t{g['op']}\t{','.join(g['files'])}" for g in globus]).encode()).hexdigest()[:12]
+        return {"accession": acc, "items": items, "globus": globus, "token": token, "dataset": dataset}
+
+    def _globus_intents(self, acc):
+        """[(path, intent, owner uid, problem)] of the valid Globus intents of @p acc (see read_own_json)."""
+        out = []
+        for ip in sorted(glob.glob(os.path.join(self.root, ".ops", "globus-*.json"))):
+            try:
+                it, owner, problem = read_own_json(ip, "intent")
+            except CorruptRecord:
+                continue
+            if (not isinstance(it, dict) or it.get("kind") != "globus" or it.get("accession") != acc
+                    or not isinstance(it.get("files"), list) or not all(isinstance(n, str) for n in it["files"])
+                    or not isinstance(it.get("task"), str) or not isinstance(it.get("inbox"), str)):
+                continue
+            try:
+                inside(os.path.join(self.root, ".work", acc, "globus"), it["inbox"])
+                [safe_name(n) for n in it["files"]]
+            except (PxdError, TypeError):
+                continue
+            out.append((ip, it, owner, problem))
+        return out
 
     def delete(self, acc, files=None, dataset=False, derived_only=False, token=None, status="ok"):
         """Deletes exactly the items of delete_plan(...) whose token the caller confirms."""
@@ -752,15 +845,58 @@ class Mirror:
                     os.rmdir(d)
                     d = os.path.dirname(d)
 
+            t = now()
+
             def mark(m):
-                t = now()
                 for kind, key in gone:
                     (m["files"] if kind == "file" else m["conversions"])[key].update(status="deleted", deleted=t, deleted_by=user())
+                for g in plan["globus"]:               # files still in flight: a later delivery must not bring them back
+                    for n in g["files"]:
+                        if n in m["files"] and m["files"][n].get("status") != "deleted":
+                            m["files"][n].update(status="deleted", deleted=t, deleted_by=user())
                 if dataset:
-                    m["status"] = "deleted"
+                    m.update(status="deleted", deleted=t, deleted_by=user())
             self._update_manifest(acc, mark)
-            self._sync(acc, self._event("delete", acc, {"items": [list(g) for g in gone], "dataset": dataset}))
+            self._sync(acc, self._event("delete", acc, {"items": [list(g) for g in gone], "dataset": dataset,
+                                                        "globus": [g["op"] for g in plan["globus"]]}))
+            for g in plan["globus"]:
+                self._discard_globus(g)
             return gone
+
+    def _discard_globus(self, g):
+        """After a delete: remove what a Globus task delivered of the deleted files (and cancel the task if it is
+        ours and everything it carries is deleted). Deliveries arriving later are discarded by the next get of its
+        owner (_deleted_since)."""
+        left = []
+        for n in g["files"]:
+            d = os.path.join(g["inbox"], n)
+            try:
+                if os.path.lexists(d):
+                    os.unlink(d)
+            except OSError as e:
+                left.append(f"{n} ({e.strerror})")
+        if left:
+            log(f"globus task {g['task']} of {_uname(g['owner'])}: could not discard {', '.join(left[:5])} in {g['inbox']}")
+        if not g["own"]:
+            log(f"globus task {g['task']} belongs to {_uname(g['owner'])}; its later deliveries of deleted files are "
+                "discarded by their next get")
+            return
+        try:
+            it, _, problem = read_own_json(g["intent"], "intent")
+        except CorruptRecord:
+            return
+        if not it or problem or not set(it["files"]) <= set(g["files"]):
+            return                                         # the task also carries files that are not deleted
+        st = tx.globus_status(g["task"])
+        if st not in ("SUCCEEDED", "FAILED", "CANCELED", "CANCELLED") and tx._cli():
+            st = tx.globus_cancel(g["task"])
+        if st in ("SUCCEEDED", "FAILED", "CANCELED", "CANCELLED"):
+            try:
+                if not os.listdir(g["inbox"]):
+                    os.rmdir(g["inbox"])
+                os.unlink(g["intent"])
+            except OSError:
+                pass
 
     # ---------------------------------------------------------------- convert
     def convert(self, acc, names, fmt, tool=None, threads=8, stage=None, allow_trfp2=False, tools_json=None):
@@ -797,8 +933,9 @@ class Mirror:
             if lk is None:
                 return ("locked", rel)
             base = os.path.abspath(os.path.expanduser(stage or self.cfg.get("paths", "scratch")))
+            self._refuse_forbidden(base, "conversion staging")
             try:
-                mkdirs(base, 0o700)                      # per-user staging: private
+                base = private_dir(base)                 # ours, 0700, and nobody can rename it away
             except OSError as e:
                 raise PxdError(f"conversion staging {base} not usable ({e}); set paths.scratch or --stage")
             sd = tempfile.mkdtemp(prefix=f"{acc}-{stem}-", dir=base)
@@ -818,13 +955,17 @@ class Mirror:
                 outp = os.path.join(sd, "out" + cv.EXT[fmt])
                 argv = cv.argv(spec, fmt, inp, outp, threads)
                 env = dict(os.environ, **spec.get("env", {}))
+                if cv.identify(tname, spec) != ident:          # re-checked right before it runs
+                    raise PxdError(f"tool {tname} changed during staging; not run")
                 t0, started = time.time(), now()
                 r = subprocess.run(argv, capture_output=True, text=True, env=env)
                 secs = round(time.time() - t0, 1)
                 val = cv.validate(fmt, outp) if r.returncode == 0 else {"ok": False, "why": f"exit {r.returncode}: {(r.stderr or r.stdout)[-300:]}"}
                 cid = f"{acc}:{name}:{fmt}:{rec}"
                 entry = {"source_name": name, "source_md5": src["md5"], "format": fmt, "recipe": rec, "output_path": rel,
-                         "tool": {k: ident[k] for k in ("name", "version", "path", "sha256", "deployment")},
+                         "tool": {**{k: ident[k] for k in ("name", "version", "path", "sha256", "deployment", "tree_sha256")},
+                                  **({"recipe_deployment_sha256": spec["recipe_deployment_sha256"]}
+                                     if spec.get("recipe_deployment_sha256") else {})},
                          "argv": [a.replace(sd, "<stage>") for a in argv], "env": spec.get("env", {}),
                          "host": socket.gethostname(), "started": started, "seconds": secs,
                          "validator": cv.VALIDATOR, "validation": val, "status": "ok" if val["ok"] else "failed"}
@@ -850,6 +991,10 @@ class Mirror:
         """Read-only scan (writes only the plan file). Only files whose name, size and MD5 match PRIDE's checksum
         for the accession in their path are candidates; everything else stays where it is."""
         self._need_root()
+        for s in srcs:
+            self._refuse_forbidden(s, "migration source")
+        if out:
+            self._refuse_forbidden(os.path.dirname(os.path.abspath(out)) or "/", "plan file")
         cand, other = {}, {}
         for s in srcs:
             for dp, dns, fns in os.walk(s):
@@ -984,6 +1129,8 @@ class Mirror:
             with self._file_lock(acc, n, wait=300) as lk:
                 if lk is None:
                     return ("locked", "file busy")
+                if _under(src, self.cfg.get("paths", "forbidden_roots")):
+                    return ("left", "under a forbidden root (paths.forbidden_roots)")
                 st = os.lstat(src)
                 if (not stat.S_ISREG(st.st_mode) or (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns) != (dev, ino, size, mtime_ns)):
                     return ("left", "source changed since the plan")
@@ -1017,6 +1164,7 @@ class Mirror:
         binary hashes were never recorded and stay unknown."""
         acc = os.path.basename(os.path.normpath(legacy_dir))
         safe_name(acc)
+        self._refuse_forbidden(legacy_dir, "legacy directory")
         old = read_json(os.path.join(legacy_dir, "manifest.json"), "legacy manifest")
         out = []
         if not old:
@@ -1028,6 +1176,8 @@ class Mirror:
                 if not n.lower().endswith(".mzml"):
                     out.append((acc, key, "left", "not an mzML")); continue
                 src_old = os.path.join(legacy_dir, key)
+                if _under(src_old, [legacy_dir]) is None or _under(src_old, self.cfg.get("paths", "forbidden_roots")):
+                    out.append((acc, key, "left", "path outside the legacy directory or under a forbidden root")); continue
                 man = self.manifest(acc)
                 srcrec = man["files"].get(d.get("source"))
                 if not srcrec or srcrec.get("status") != "ok" or srcrec.get("md5") != d.get("source_md5"):
@@ -1282,6 +1432,7 @@ class Mirror:
                     checks.append(("acl", "PROBLEM", "no default ACL on the root: run pxd doctor --fix as its owner, "
                                    "or set permissions.default_acl = false on a file system without ACLs"))
                     acl = False
+        ops = os.path.join(self.root, ".ops")
         for dp, dns, fns in os.walk(self.root):
             for name in [None] + dns + fns:
                 path = dp if name is None else os.path.join(dp, name)
@@ -1299,6 +1450,11 @@ class Mirror:
                 mode = stat.S_IMODE(st.st_mode)
                 isdir = stat.S_ISDIR(st.st_mode)
                 want = want_dir if isdir else want_file
+                if not isdir and dp == ops and name.endswith(".json"):
+                    want = self._intent_mode()          # intents: writable only by their owner (recover)
+                    if mode != want:                    # never "repaired": its content may have been changed
+                        problem("intent mode (check its content, then chmod 640 it, or remove it)", path, st.st_uid)
+                        continue
                 bad = []
                 if st.st_gid != gid:
                     bad.append("group")

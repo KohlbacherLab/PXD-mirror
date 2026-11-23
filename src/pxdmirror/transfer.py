@@ -253,6 +253,15 @@ def globus_submit(pairs, label):
     return r.stdout.strip()
 
 
+def globus_cancel(task):
+    """Ask Globus to cancel @p task (best effort); returns the status afterwards."""
+    try:
+        subprocess.run([_cli() or G["cli"], "task", "cancel", task], capture_output=True, text=True, timeout=300)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        log(f"globus task {task}: cancel failed ({type(e).__name__})")
+    return globus_status(task)
+
+
 def globus_wait(task, hours):
     """'SUCCEEDED', 'FAILED', or 'ACTIVE' if it is still running after a cancel attempt (caller must not fall back)."""
     cli = _cli() or G["cli"]

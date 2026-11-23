@@ -125,7 +125,8 @@ def offline(root):
     util.mkdirs(m.ds(acc, "raw"))
     os.link(s3, m.ds(acc, "raw", "b.raw"))
     util.write_json(os.path.join(root, ".ops", "pub-crash.json"), {"op": "pub-crash", "kind": "publish", "accession": acc,
-                    "rel": "raw/b.raw", "staged": s3, "md5": e3["md5"], "record": {"kind": "file", "key": "b.raw", "entry": e3}})
+                    "rel": "raw/b.raw", "staged": s3, "md5": e3["md5"], "record": {"kind": "file", "key": "b.raw", "entry": e3}},
+                    0o640)
     rec = m.recover()
     ok("recover completes a half-done publication", any("completed" in r[1] for r in rec)
        and m.manifest(acc)["files"]["b.raw"]["status"] == "ok" and not os.path.exists(s3), rec)
@@ -193,7 +194,7 @@ def offline(root):
     ok("delete with empty --files refused", raises(lambda: m.delete_plan(acc, files=[]), UsageError))
     r = cli(root, "delete", acc, "--files", "b.raw")
     ok("cli delete without --yes lists, deletes nothing", r.returncode == 0 and "raw/b.raw" in r.stdout
-       and "nothing deleted" in r.stdout and os.path.exists(m.ds(acc, "raw", "b.raw")), r.stdout)
+       and "nothing deleted" in r.stdout and os.path.exists(m.ds(acc, "raw", "b.raw")), (r.stdout, r.stderr))
     token = r.stdout.split("token ")[1].split()[0]
     ok("cli delete with a wrong token refused", cli(root, "delete", acc, "--files", "b.raw", "--yes", "--confirm", "nope").returncode == 2)
     r = cli(root, "delete", acc, "--files", "b.raw", "--yes", "--confirm", token)

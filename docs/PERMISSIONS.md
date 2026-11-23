@@ -11,7 +11,7 @@ data sets, publish conversions, delete files and data sets, and clean up what an
 | **setgid directories** | mode `2770` (`drwxrws---`) | new files and directories inherit the directory's group instead of the creator's primary group |
 | **default ACL** | `default:group::rwx`, `default:other::---` on the root, `.locks`, `.ops`, `.work` | new entries are group-writable even when a member's umask would remove the group's write bit |
 | **explicit modes and umask** | files `660`, directories `2770`, process umask `007` | the same result on file systems without ACL support (many ZFS, NFS and local setups) |
-| ~~sticky bit~~ | **never** `+t` | see below |
+| ~~sticky bit~~ | **never** `+t` on mirror directories | see below (above an *installation* it is right: see "Installing the tool for a group") |
 
 `pxd init` sets all of this up for the root and its internal directories (`permissions.group` names the
 group, `permissions.default_acl` the ACL). Every directory pxd creates gets `2770`, every file `660`
@@ -87,11 +87,39 @@ setfacl -R -m g::rwx,o::--- -d -m g::rwx,o::--- /shared/proteomics/pxd    # wher
 
 ## Installing the tool for a group
 
-Install the code and the converter binaries where **only maintainers can write** (directories `2755` or
-`755`, files `644`, executables `755`), not in a group-writable directory: any member could otherwise
-replace a converter or the package that everybody else then runs. Pin converter binaries with `sha256` in
-`tools.json`; pxd refuses a binary whose hash changed. The parent directory of the installation matters too:
-if it is group-writable without the sticky bit, a member can rename the installation directory away and put
-another one in its place, so choose a parent that only maintainers can write.
+Whatever every member runs must be writable only by its maintainers; the mirror data, on the other hand,
+must be group-writable. Keep the two apart.
 
-The mirror data, on the other hand, must be group-writable. Keep the two apart.
+- **The package** (`bin/pxd`, `src/`, the site file): directories `2755` or `755`, files `644`, `bin/pxd`
+  `755`, no ACL granting the group write access.
+- **The converters, all of them:** not only the executable but everything it loads: its deployment prefix
+  (OpenMS `bin/` and `lib/`), every shared library the dynamic loader resolves (a conda environment named in
+  an `RPATH` counts), and runtimes named in `env` (`DOTNET_ROOT`). Copy them into a maintainer-only tree and
+  make the binaries look only there (`LD_LIBRARY_PATH`, or relink an absolute `RPATH` that points elsewhere).
+  pxd checks this before every conversion and refuses a tool whose files another user could change; the
+  `sha256`, `deployment_sha256` and `tree_sha256` pins in `tools.json` then catch a change by the maintainers
+  themselves (see "Converter registry" in [CONFIGURATION.md](CONFIGURATION.md)).
+- **Every directory above them:** if one of them is group-writable without the sticky bit, a member can
+  rename the installation (or a whole parent) away and put another one in its place, and everybody then
+  runs that. Choose parents that only root or the maintainers can write, or ask the administrators to set
+  the sticky bit (`chmod +t`) on group-writable parents. Here the sticky bit is right: it stops members
+  from renaming entries they do not own. `pxd doctor` and `pxd config` warn about such parents of the
+  installation, and `pxd convert` about such parents of a converter.
+
+### Per-user staging
+
+`pxd convert` copies the input into `paths.scratch` (default `{tmp}/pxd-{user}`) and runs the converter
+there. pxd creates the directory `0700` and refuses one that is not the caller's, is writable for others,
+or sits below a directory through which another user could rename it away: a world-writable `/scratch`
+without the sticky bit lets anybody replace `/scratch/<you>` with a directory of their own and swap the
+converter's input or output. `/tmp` (mode `1777`) is fine. Ask the administrators for `chmod +t` on a
+world-writable scratch file system, and use `/tmp` or `convert --stage DIR` until then.
+
+### Intents
+
+Every write first records an intent in `.ops/`, so that `pxd recover` can finish or report it after a
+crash. Intents are written `640` and acted on only by their owner: `.ops` is writable for the whole group,
+and an intent names paths (a staging file, the symlink back at a migrated file's old place) that must not be
+chosen by somebody else. `pxd doctor` reports an intent that is not `640` and `--fix` leaves it alone:
+check its content (the paths it names), then `chmod 640` it so that its owner's `pxd recover` finishes it, or
+remove it.
